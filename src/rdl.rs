@@ -540,6 +540,10 @@ pub struct Route {
     pub next: usize,
     pub priority: i32,
     pub routed: bool,
+    /// Set until the route has been taken off the queue at least once.
+    pub pending: bool,
+    /// The path committed for this route, empty when it is not routed.
+    pub points: Vec<Point>,
 }
 
 /// Squared distance — exact in integers, and all the ordering rules need.
@@ -596,6 +600,79 @@ impl Route {
             o => o,
         }
     }
+}
+
+/// **L1** — a route has failed when it is off the queue, unrouted, and out of destinations.
+///
+/// ⚠️ All three. A route still on the queue has not failed, it has not been tried; and one with
+/// destinations left is not finished with.
+pub fn is_failed(r: &Route) -> bool {
+    !r.pending && !r.routed && !r.has_next()
+}
+
+/// **L2** — the failures worth acting on.
+///
+/// ⚠️ A route whose own source terminal was reached by **some other** route is not a failure: the
+/// bump is connected, just not by this route. Counting it would rip up working routes to retry
+/// something already done.
+pub fn failed_routes(routes: &[Route]) -> Vec<usize> {
+    let reached: std::collections::BTreeSet<&str> = routes
+        .iter()
+        .filter(|r| r.routed)
+        .flat_map(|r| {
+            std::iter::once(r.source.as_str())
+                .chain(r.peek().map(|d| d.terminal.as_str()))
+        })
+        .collect();
+    routes
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_failed(r) && !reached.contains(r.source.as_str()))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// **L3** — the corridor a failed route probes when looking for routes to displace.
+///
+/// A straight line from the route's source to **one of** its destinations, widened by a margin.
+///
+/// ⚠️ Two things change with each failure, and they are the whole convergence mechanism: the
+/// destination index **rotates** (`priority % count`), so a route that keeps failing probes a
+/// different corridor each round rather than the same one; and the margin **widens**
+/// (`(priority + 1) * extent`), so it displaces more each time. Fixing either one makes a
+/// congested design loop until the iteration limit instead of resolving.
+pub fn ripup_probe(r: &Route, extent: i32) -> Option<(Point, Point, i32)> {
+    if r.dests.is_empty() {
+        return None;
+    }
+    let idx = (r.priority.max(0) as usize) % r.dests.len();
+    Some((r.centre, r.dests[idx].centre, (r.priority + 1) * extent))
+}
+
+/// **L4** — may this routed route be displaced for a failure of that priority?
+///
+/// ⚠️ `>=`, not `>`. A route may displace another of **equal** priority; without that a design
+/// where everything has failed once can never rearrange itself.
+pub fn allows_ripup(candidate: &Route, failed_priority: i32) -> bool {
+    candidate.routed && failed_priority >= candidate.priority
+}
+
+/// **L5** — which routed routes a failure would displace.
+pub fn ripup_targets(failed: &Route, routes: &[Route], extent: i32) -> Vec<usize> {
+    let Some((a, b, margin)) = ripup_probe(failed, extent) else {
+        return Vec::new();
+    };
+    routes
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| allows_ripup(r, failed.priority))
+        .filter(|(_, r)| {
+            r.points
+                .iter()
+                .any(|&p| hits(a, b, (p.0 - margin, p.1 - margin, p.0 + margin, p.1 + margin)))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// **R3** — the corridor a committed route takes out of the graph.
@@ -686,7 +763,78 @@ mod tests {
             next: 0,
             priority: 0,
             routed: false,
+            pending: true,
+            points: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_route_has_failed_only_when_it_is_off_the_queue_and_out_of_options() {
+        let mut r = route((0, 0), 1, vec![dest("p", "P", (10, 0), false, 1)]);
+        assert!(!is_failed(&r), "still on the queue");
+        r.pending = false;
+        assert!(!is_failed(&r), "still has a destination to try");
+        r.next = 1;
+        assert!(is_failed(&r));
+        r.routed = true;
+        assert!(!is_failed(&r), "routed is not failed");
+    }
+
+    #[test]
+    fn a_bump_reached_by_another_route_is_not_a_failure() {
+        // ⚠️ Counting it would rip up working routes to retry something already connected.
+        let mut mine = route((0, 0), 1, vec![]);
+        mine.source = "BUMP_A/PAD".into();
+        mine.pending = false;
+        let mut other = route((0, 0), 2, vec![dest("BUMP_A/PAD", "BUMP_A", (5, 5), true, 3)]);
+        other.routed = true;
+        assert!(is_failed(&mine));
+        assert!(failed_routes(&[mine.clone(), other]).is_empty(), "already connected");
+        assert_eq!(failed_routes(&[mine]).len(), 1, "nobody else reached it");
+    }
+
+    #[test]
+    fn the_probe_rotates_its_destination_and_widens_each_failure() {
+        // ⚠️ The convergence mechanism. Fixing either half makes a congested design loop.
+        let mut r = route(
+            (0, 0),
+            1,
+            vec![dest("a", "A", (100, 0), false, 1), dest("b", "B", (0, 100), false, 2)],
+        );
+        let (_, first, m0) = ripup_probe(&r, 10).unwrap();
+        assert_eq!((first, m0), ((100, 0), 10));
+        r.priority = 1;
+        let (_, second, m1) = ripup_probe(&r, 10).unwrap();
+        assert_eq!(second, (0, 100), "a different corridor is probed");
+        assert_eq!(m1, 20, "and a wider one");
+        r.priority = 2;
+        assert_eq!(ripup_probe(&r, 10).unwrap().1, (100, 0), "wraps around");
+    }
+
+    #[test]
+    fn a_route_may_displace_another_of_equal_priority() {
+        // ⚠️ `>=`, not `>`: without it a design where everything has failed once cannot rearrange.
+        let mut settled = route((0, 0), 1, vec![]);
+        settled.routed = true;
+        settled.priority = 2;
+        assert!(allows_ripup(&settled, 2));
+        assert!(allows_ripup(&settled, 3));
+        assert!(!allows_ripup(&settled, 1), "a lower priority cannot displace it");
+        settled.routed = false;
+        assert!(!allows_ripup(&settled, 5), "an unrouted route has nothing to displace");
+    }
+
+    #[test]
+    fn only_routes_crossing_the_probe_are_displaced() {
+        let failing = route((0, 0), 1, vec![dest("a", "A", (1000, 0), false, 1)]);
+        let mut across = route((0, 0), 2, vec![]);
+        across.routed = true;
+        across.points = vec![(500, 0)];
+        let mut clear = route((0, 0), 3, vec![]);
+        clear.routed = true;
+        clear.points = vec![(500, 10_000)];
+        let hit = ripup_targets(&failing, &[across, clear], 10);
+        assert_eq!(hit, vec![0], "only the one in the way");
     }
 
     #[test]

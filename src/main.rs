@@ -986,6 +986,8 @@ fn rdl_route(args: &[String]) -> ExitCode {
                     next: 0,
                     priority: 0,
                     routed: false,
+                    pending: true,
+                    points: Vec::new(),
                 });
             }
         }
