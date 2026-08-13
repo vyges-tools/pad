@@ -62,6 +62,36 @@ pub fn unconstrained_start(index: usize, count: usize, prior: &[i32], row: (i32,
 /// wrote: two unit weights become 2 and 3, not 2 and 2. The symmetric version is what one would
 /// write from the algorithm's description, and it pools later violations differently.
 pub fn pool_adjacent_violators(positions: &mut [i32], weights: &mut [f32]) -> bool {
+    pool_pass(positions, weights)
+}
+
+/// **SP3b** — one round of the regression: pool violators, **then legalise**.
+///
+/// ⚠️ The legalisation is not an afterthought and not the spreading stage's job. A pooled position
+/// can land on an obstruction, and the round is not finished until every position is somewhere a
+/// pad may actually sit. Leaving it out hands the spreading stage a row that starts illegal, and
+/// the spread has no mechanism to notice — it resolves *overlaps between pads*, not pads sitting on
+/// blockages. The result is a pad committed onto an obstruction and then refused at the very last
+/// step, which reads as a placer that cannot place rather than a regression that did not finish.
+///
+/// Returns whether anything moved, which is what ends the outer loop.
+pub fn pool_round(
+    positions: &mut [i32],
+    weights: &mut [f32],
+    legal: &dyn Fn(usize, i32) -> i32,
+) -> bool {
+    let mut updated = pool_pass(positions, weights);
+    for i in 0..positions.len() {
+        let fixed = legal(i, positions[i]);
+        if fixed != positions[i] {
+            positions[i] = fixed;
+            updated = true;
+        }
+    }
+    updated
+}
+
+fn pool_pass(positions: &mut [i32], weights: &mut [f32]) -> bool {
     let mut updated = false;
     for i in 1..positions.len() {
         if positions[i] >= positions[i - 1] {
@@ -116,6 +146,26 @@ pub fn nearest_legal(
     half_width: i32,
     row: (i32, i32),
 ) -> i32 {
+    nearest_legal_side(target, obstruction, half_width, row, false, false)
+}
+
+/// **SP5b** — the same, but able to insist on a side.
+///
+/// ⚠️ `round_down` and `round_up` override the "nearer wins" rule, and the tunnelling logic uses
+/// them to ask a directed question: *where would this pad land if it kept going the way it is
+/// already travelling?* Answering with the nearer side instead makes a pad trying to jump an
+/// obstruction settle back on the side it came from.
+///
+/// The row-end checks come **first** and are not overridden: at an end there is only one way out,
+/// whichever side was asked for.
+pub fn nearest_legal_side(
+    target: i32,
+    obstruction: Option<(i32, i32)>,
+    half_width: i32,
+    row: (i32, i32),
+    round_down: bool,
+    round_up: bool,
+) -> i32 {
     let Some((lo, hi)) = obstruction else { return target };
     let (start, end) = (lo - half_width, hi + half_width);
     if start < row.0 {
@@ -124,11 +174,69 @@ pub fn nearest_legal(
     if end > row.1 {
         return start;
     }
+    if round_down {
+        return start;
+    }
+    if round_up {
+        return end;
+    }
     if (target - start) < (end - target) {
         start
     } else {
         end
     }
+}
+
+/// Where a pad ends up when it has to get past an obstruction, and where it *wanted* to be.
+///
+/// ⚠️ The two differ when the jump could not be completed — the pad is stuck on the near side, and
+/// the caller uses the difference to push whatever is in the way. Returning only the position loses
+/// the information that a push is needed, and the row never opens up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tunnel {
+    pub position: i32,
+    pub ideal: i32,
+}
+
+impl Tunnel {
+    pub fn stuck(&self) -> bool {
+        self.position != self.ideal
+    }
+}
+
+/// **SP9** — get a pad past an obstruction, or work out that it cannot.
+///
+/// `blocked` reports the obstruction a pad centred at a position would hit. The pad asks where it
+/// would land continuing in its current direction. If that is beyond the neighbour bounding it,
+/// it checks whether the boundary itself is clear: if not, it settles on the near edge of the
+/// obstruction when that is still within bounds, and otherwise **stays exactly where it is**.
+#[allow(clippy::too_many_arguments)]
+pub fn tunnel_position(
+    target: i32,
+    moving_up: bool,
+    low_bound: i32,
+    curr: i32,
+    high_bound: i32,
+    half_width: i32,
+    row: (i32, i32),
+    blocked: &dyn Fn(i32) -> Option<(i32, i32)>,
+) -> Tunnel {
+    let ideal =
+        nearest_legal_side(target, blocked(target), half_width, row, !moving_up, moving_up);
+    if ideal == target {
+        return Tunnel { position: target, ideal: target };
+    }
+    let (bound, beyond) =
+        if moving_up { (high_bound, ideal > high_bound) } else { (low_bound, ideal < low_bound) };
+    if beyond && blocked(bound).is_some() {
+        let next = nearest_legal_side(target, blocked(target), half_width, row, true, false);
+        let reachable = if moving_up { next <= high_bound } else { next >= low_bound };
+        if reachable {
+            return Tunnel { position: next, ideal };
+        }
+        return Tunnel { position: curr, ideal };
+    }
+    Tunnel { position: ideal, ideal }
 }
 
 /// Where a pad sits: its span and its centre, kept together because the loop needs both.
@@ -217,8 +325,11 @@ pub fn spread_pass(
     damper: f32,
     site: i32,
     snap: &dyn Fn(i32) -> i32,
+    blocked: &dyn Fn(usize, i32) -> Option<(i32, i32)>,
 ) -> bool {
     let mut violations = false;
+    // Pads that tried to jump an obstruction and could not, with where they wanted to be.
+    let mut stuck: Vec<(usize, i32)> = Vec::new();
     for i in 0..anchors.len() {
         let curr = anchors[i];
         let half = curr.width / 2;
@@ -241,8 +352,76 @@ pub fn spread_pass(
             damper,
             site,
         );
+        // ⚠️ The jump is decided on the CLAMPED move, not the raw one: a pad may only try to get
+        // past an obstruction that lies within reach of its neighbours.
+        let mut move_by = move_by;
+        if move_by != 0 {
+            let check = (curr.centre + move_by).clamp(prev_pos, next_pos);
+            let probe = |c: i32| blocked(i, c);
+            let t = tunnel_position(
+                check,
+                move_by > 0,
+                prev_pos,
+                curr.centre,
+                next_pos,
+                half,
+                row,
+                &probe,
+            );
+            move_by = t.position - curr.centre;
+            if t.stuck() {
+                stuck.push((i, t.ideal));
+            }
+        }
+
         let want = snap(curr.centre + move_by - half) + half;
         anchors[i].set_location(want.clamp(prev_pos, next_pos) - half);
+    }
+
+    // **SP10** — a pad that could not jump pushes the pads in its way.
+    //
+    // ⚠️ Without this the row deadlocks: the blocked pad has nowhere to go, the pads under the
+    // obstruction have no reason to move, and the loop runs to its iteration limit reporting a
+    // violation it can never clear.
+    for (i, ideal) in stuck {
+        let delta = ideal - anchors[i].centre;
+        let push = if delta < 0 { -1 } else { 1 }
+            * ((damper * delta.abs() as f32) / site as f32).ceil() as i32
+            * site;
+        let mut last = i;
+        let mut targets_to_push: Vec<usize> = Vec::new();
+        if delta > 0 {
+            for j in (i + 1)..anchors.len() {
+                if anchors[j].centre <= ideal {
+                    targets_to_push.push(j);
+                    last = j;
+                }
+            }
+        } else {
+            for j in (0..i).rev() {
+                if anchors[j].centre >= ideal {
+                    targets_to_push.push(j);
+                    last = j;
+                }
+            }
+        }
+        let bound = if delta > 0 {
+            if last + 1 == anchors.len() { row.1 } else { anchors[last + 1].centre }
+        } else if last == 0 {
+            row.0
+        } else {
+            anchors[last - 1].centre
+        };
+        for j in targets_to_push {
+            let want = if push < 0 {
+                bound.max(anchors[j].centre + push)
+            } else {
+                bound.min(anchors[j].centre + push)
+            };
+            let half = anchors[j].width / 2;
+            anchors[j].set_location(snap(want - half));
+        }
+        violations = true;
     }
     violations
 }
@@ -293,7 +472,7 @@ mod tests {
     fn a_pass_separates_two_overlapping_pads() {
         let mut a = anchors(&[(1000, 1000), (1500, 1000)]);
         let targets = [1500, 2000];
-        let had = spread_pass(&mut a, &targets, (0, 10_000), 0.1, 0.5, 0.2, 100, &|p| p);
+        let had = spread_pass(&mut a, &targets, (0, 10_000), 0.1, 0.5, 0.2, 100, &|p| p, &|_, _| None);
         assert!(had, "the pass reports the overlap it found");
         assert!(a[1].min >= a[0].min, "and the order is preserved");
     }
@@ -302,7 +481,7 @@ mod tests {
     fn a_settled_row_reports_no_violation() {
         let mut a = anchors(&[(0, 1000), (2000, 1000), (4000, 1000)]);
         let targets = [500, 2500, 4500];
-        assert!(!spread_pass(&mut a, &targets, (0, 10_000), 0.0, 0.5, 0.2, 100, &|p| p));
+        assert!(!spread_pass(&mut a, &targets, (0, 10_000), 0.0, 0.5, 0.2, 100, &|p| p, &|_, _| None));
     }
 
     #[test]
@@ -310,7 +489,7 @@ mod tests {
         // ⚠️ The middle pad cannot pass either neighbour however hard the spring pulls.
         let mut a = anchors(&[(0, 100), (1000, 100), (2000, 100)]);
         let targets = [50, 900_000, 2050];
-        spread_pass(&mut a, &targets, (0, 10_000), 1.0, 0.5, 1.0, 10, &|p| p);
+        spread_pass(&mut a, &targets, (0, 10_000), 1.0, 0.5, 1.0, 10, &|p| p, &|_, _| None);
         assert!(a[1].centre <= a[2].centre, "never past the pad ahead");
         assert!(a[1].centre >= a[0].centre, "nor behind the one before");
     }
@@ -370,6 +549,42 @@ mod tests {
         assert_eq!(forces(SPRING_FADE_TO + 1).0, 0.0, "and nothing after");
         // Repulsion does not vary: both ends of its schedule are the same.
         assert_eq!(forces(0).1, forces(MAX_ITERATIONS).1);
+    }
+
+    #[test]
+    fn a_directed_legalisation_insists_on_its_side() {
+        // ⚠️ "Nearer wins" would put this back on the low side; the jump needs the high one.
+        let obs = Some((400, 600));
+        assert_eq!(nearest_legal_side(450, obs, 50, (0, 1000), false, true), 650, "forced up");
+        assert_eq!(nearest_legal_side(580, obs, 50, (0, 1000), true, false), 350, "forced down");
+        // At a row end there is only one way out, whichever side was asked for.
+        assert_eq!(nearest_legal_side(20, Some((0, 100)), 50, (0, 1000), true, false), 150);
+    }
+
+    #[test]
+    fn a_clear_target_needs_no_tunnel() {
+        let t = tunnel_position(500, true, 0, 400, 1000, 50, (0, 1000), &|_| None);
+        assert_eq!(t, Tunnel { position: 500, ideal: 500 });
+        assert!(!t.stuck());
+    }
+
+    #[test]
+    fn a_pad_jumps_an_obstruction_when_there_is_room_beyond_it() {
+        let obs = |p: i32| if (400..=600).contains(&p) { Some((400, 600)) } else { None };
+        let t = tunnel_position(500, true, 0, 300, 900, 50, (0, 1000), &obs);
+        assert_eq!(t.position, 650, "landed past it");
+        assert!(!t.stuck());
+    }
+
+    #[test]
+    fn a_pad_blocked_in_by_its_neighbour_stays_put_and_reports_it() {
+        // ⚠️ The neighbour is at 620, so the far side of the obstruction (650) is out of reach and
+        // the boundary itself is inside the obstruction. The pad must not move, and the caller has
+        // to learn that a push is needed.
+        let obs = |p: i32| if (400..=700).contains(&p) { Some((400, 600)) } else { None };
+        let t = tunnel_position(500, true, 0, 300, 620, 50, (0, 1000), &obs);
+        assert!(t.stuck(), "reported as stuck");
+        assert_eq!(t.ideal, 650, "and remembers where it wanted to be");
     }
 
     #[test]

@@ -1860,11 +1860,13 @@ fn bump_pads(db: &Db, track: &Track, pads: &[Pad]) -> Vec<BumpPad> {
 }
 
 /// **SP1-SP8** — place a row by spreading pads out from where their bumps want them.
+#[allow(clippy::too_many_arguments)]
 fn place_force_directed(
     track: &Track,
     pads: &[Pad],
     aligned: &[BumpPad],
     conflict: &mut dyn FnMut(&str, Rect, Orient) -> Option<vyges_pad::Refusal>,
+    conflict_probe: &dyn Fn(&str, Rect) -> Option<Rect>,
     settled: &mut dyn FnMut(&Placement),
 ) -> Result<Vec<Placement>, Refused> {
     use vyges_pad::spread::{forces, ideal_position, spread_pass, Anchor, DAMPER, MAX_ITERATIONS};
@@ -1885,11 +1887,33 @@ fn place_force_directed(
         targets.push(t);
     }
 
+    // What **this** pad, centred here, would run into — as an extent along the row.
+    //
+    // ⚠️ Per pad, not one probe for the row. Pads differ in width and each is excused its own
+    // metal, so asking on another pad's behalf gives an obstruction that is the wrong size and in
+    // the wrong place, and the jump logic then aims at a gap that is not there.
+    let blocked = |i: usize, centre: i32| -> Option<(i32, i32)> {
+        let pad = &pads[i];
+        let (w, h) = pad.size;
+        let (dx, dy) = oriented_size(w, h, track.row.orient);
+        let (half_x, half_y) = (dx / 2, dy / 2);
+        let bbox = if horizontal {
+            (centre - half_x, track.row.bbox.1, centre + half_x, track.row.bbox.1 + dy)
+        } else {
+            (track.row.bbox.0, centre - half_y, track.row.bbox.0 + dx, centre + half_y)
+        };
+        conflict_probe(&pad.name, bbox).map(|r| if horizontal { (r.0, r.2) } else { (r.1, r.3) })
+    };
+
     // ── Restore order along the row ──────────────────────────────────────────────────────────
     let mut ordered = targets.clone();
     let mut weights = vec![1.0f32; ordered.len()];
+    let legalise = |i: usize, pos: i32| {
+        let half = vyges_pad::pad_width(track, pads[i].size) / 2;
+        vyges_pad::spread::nearest_legal(pos, blocked(i, pos), half, row)
+    };
     for _ in 0..ordered.len() {
-        if !vyges_pad::spread::pool_adjacent_violators(&mut ordered, &mut weights) {
+        if !vyges_pad::spread::pool_round(&mut ordered, &mut weights, &legalise) {
             break;
         }
     }
@@ -1904,7 +1928,7 @@ fn place_force_directed(
     let snap = |p: i32| track.index_to_pos(track.snap_to_site(p));
     for k in 0..MAX_ITERATIONS {
         let (spring, repel) = forces(k);
-        if !spread_pass(&mut anchors, &ordered, row, spring, repel, DAMPER, site, &snap) {
+        if !spread_pass(&mut anchors, &ordered, row, spring, repel, DAMPER, site, &snap, &blocked) {
             break;
         }
     }
@@ -2081,7 +2105,21 @@ fn place_pads(args: &[String]) -> ExitCode {
     // ⚠️ `i32::MIN` is the marker set above for bump-aligned mode, not a spacing.
     let result = if max_spacing == Some(i32::MIN + 1) {
         let aligned = bump_pads(&db, &track, &pads);
-        place_force_directed(&track, &pads, &aligned, &mut conflict, &mut settle)
+        {
+            // ⚠️ The row's own orientation, not `R0`. A pad in a side row is turned, and asking
+            // where its metal would be if it were NOT turned puts every shape in the wrong place —
+            // so the probe reports clear ground, the spread walks onto an obstruction, and the
+            // final placement refuses a position the placer itself chose.
+            let probe_orient = track.row.orient;
+            let probe = |name: &str, bbox: (i32, i32, i32, i32)| {
+                let (shapes, outline) = shapes_at(name, bbox, probe_orient);
+                refuse(name, bbox, &outline, &shapes, &fixed.borrow(), &stops, &|l| {
+                    db.layer_get_spacing(l)
+                })
+                .map(|r| r.overlap)
+            };
+            place_force_directed(&track, &pads, &aligned, &mut conflict, &probe, &mut settle)
+        }
     } else if max_spacing == Some(i32::MIN) {
         let aligned = bump_pads(&db, &track, &pads);
         place_bump_aligned(&track, &pads, &aligned, &mut conflict, &mut settle)
@@ -2095,8 +2133,11 @@ fn place_pads(args: &[String]) -> ExitCode {
             eprintln!("vyges-pad: {name} at {at:?} does not fit inside {}", track.row.name);
             return ExitCode::from(2);
         }
-        Err(Refused::Blocked { name, why }) => {
-            eprintln!("vyges-pad: cannot place {name}: {:?}", why.reason);
+        Err(Refused::Blocked { name, at, why }) => {
+            eprintln!(
+                "vyges-pad: cannot place {name} at {at:?}: {:?} overlapping {:?}",
+                why.reason, why.overlap
+            );
             return ExitCode::from(2);
         }
     };

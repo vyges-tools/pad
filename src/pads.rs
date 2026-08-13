@@ -81,7 +81,11 @@ pub enum Refused {
     /// The cell ran off the end of the row.
     OutOfRow { name: String, at: Rect },
     /// The cell hit something and shifting could not clear it.
-    Blocked { name: String, why: Refusal },
+    ///
+    /// ⚠️ Carries **where** it was tried. A refusal that names only the cell and the blocker leaves
+    /// the reader unable to tell a placer that chose badly from a check that is too strict — the
+    /// two want opposite fixes.
+    Blocked { name: String, at: Rect, why: Refusal },
 }
 
 /// **P2** — how much of the row's length a pad consumes.
@@ -166,7 +170,7 @@ pub fn place_one(
                             orient,
                         });
                     }
-                    return Err(Refused::Blocked { name: pad.name.clone(), why });
+                    return Err(Refused::Blocked { name: pad.name.clone(), at: bbox, why });
                 }
                 let obstacle = t.along(why.overlap).0;
                 index = (index + 1).max(t.snap_to_site(obstacle));
