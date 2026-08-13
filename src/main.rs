@@ -11,9 +11,10 @@
 use std::process::ExitCode;
 use vyges_pad::clearance::Rect;
 use vyges_opendb::Db;
-use vyges_pad::{corner_placement, corner_row_names, make_rows, mirror_base, oriented_size,
+use vyges_pad::{bumps, corner_placement, corner_row_names, make_rows, mirror_base, oriented_size,
     outline_of, place_in_row, refuse, snap_to_site, transform, Blocker, Offsets, Orient,
     Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
+use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
@@ -24,6 +25,10 @@ USAGE:
   vyges loom pad place-corners  <design.odb> --master M [--ring-index N] [options]
   vyges loom pad place-pad      <design.odb> --row R --location D [--master M]
                                 [--mirror] --inst NAME [options]
+  vyges loom pad make-io-bump-array <design.odb> --bump M --origin 'X Y' --rows N
+                                   --columns N --pitch 'DX [DY]' [--prefix P] [options]
+  vyges loom pad remove-io-bump <design.odb> --inst NAME [options]
+  vyges loom pad remove-io-bump-array <design.odb> --bump M [options]
   vyges loom pad --describe
   vyges loom pad --help
 
@@ -41,6 +46,11 @@ OPTIONS:
   --location D           where along that row, in MICRONS (place-pad)
   --inst NAME            the instance to place or create (place-pad)
   --mirror               mirror the pad about the row
+  --bump M               the bump master (make-io-bump-array)
+  --origin 'X Y'         the lower-left bump, in MICRONS
+  --rows N / --columns N the shape of the array
+  --pitch 'DX [DY]'      spacing in MICRONS; one value means both axes
+  --prefix P             instance name prefix (default BUMP_)
   --out-odb FILE         write the database here (default: IN PLACE, over the input)
   --out-def FILE         also write the result as DEF (for diffing against a golden)
   --dry-run              report the ring, write nothing
@@ -136,6 +146,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 o.keys.push((a.trim_start_matches('-').to_string(), v));
             }
             a if a.starts_with('-') => return Err(format!("unknown option `{a}`")),
+            // ⚠️ A second bare word is rejected, not taken. Silently overwriting the design path
+            // would make `pad make-io-bump-array design.odb 200 --origin ...` read a file named
+            // `200` -- an unquoted list is a common way to arrive here, and the failure would look
+            // like a missing file rather than a mistyped command.
+            a if odb.is_some() => return Err(format!("unexpected argument `{a}`")),
             a => odb = Some(a.to_string()),
         }
         i += 1;
@@ -560,6 +575,133 @@ fn emit_placement_events(what: &str, placed: &[Placement], skipped: &[String]) {
     );
 }
 
+/// **U1** — a grid of bumps over the die.
+fn make_io_bump_array(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let dbu = db.dbu_per_micron();
+
+    let built = (|| -> Result<Vec<Placement>, String> {
+        let master = opts.need("bump")?.to_string();
+        // The reference refuses anything that is not a bump, rather than placing it on the cover
+        // layer and leaving the surprise for whoever reads the result.
+        let class = db.master_get_type(&master).unwrap_or_default();
+        if class.is_empty() {
+            return Err(format!("no master named `{master}` in this design"));
+        }
+        if !is_bump_master(&class) {
+            return Err(format!("{master} is `{class}`, not a COVER BUMP"));
+        }
+
+        // ⚠️ The two look alike and are not: an origin must be a PAIR, while a pitch may be a
+        // single value meaning the same spacing on both axes. The reference rejects `-origin 200`
+        // and accepts `-pitch 200`, and has a distinct diagnostic for each.
+        let nums = |key: &str| -> Result<Vec<f64>, String> {
+            Ok(opts
+                .need(key)?
+                .split_whitespace()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect())
+        };
+        let um = |v: f64| (v * dbu as f64).round() as i32;
+        let origin = match nums("origin")?[..] {
+            [x, y] => (x, y),
+            _ => return Err("--origin must be specified as `x y`".into()),
+        };
+        let pitch = match nums("pitch")?[..] {
+            [d] => (d, d),                   // one pitch means the same on both axes
+            [dx, dy] => (dx, dy),
+            _ => return Err("--pitch must be specified as `deltax deltay` or `delta`".into()),
+        };
+        let count = |key: &str| -> Result<i32, String> {
+            opts.need(key)?.parse().map_err(|_| format!("--{key} wants a whole number"))
+        };
+
+        Ok(bumps(&Array {
+            master,
+            prefix: opts.get("prefix").unwrap_or(DEFAULT_PREFIX).to_string(),
+            origin: (um(origin.0), um(origin.1)),
+            rows: count("rows")?,
+            columns: count("columns")?,
+            pitch: (um(pitch.0), um(pitch.1)),
+        }))
+    })();
+
+    let placed = match built {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !opts.dry_run {
+        for p in &placed {
+            if let Err(e) = commit(&mut db, p, true) {
+                eprintln!("vyges-pad: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    finish(&opts, &mut db, "bump-array", &placed, &[])
+}
+
+/// **U3** — take bumps back out, one instance or a whole master's worth.
+///
+/// ⚠️ Guarded by the same master-type check as creation, and for the same reason: `remove_io_bump`
+/// names an instance, and without the guard a mistyped name that happens to hit a real cell would
+/// delete a pad or a macro instead of a bump.
+fn remove_io_bump(args: &[String], whole_array: bool) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let chosen = (|| -> Result<Vec<String>, String> {
+        if whole_array {
+            let master = opts.need("bump")?;
+            let class = db.master_get_type(master).unwrap_or_default();
+            if class.is_empty() {
+                return Err(format!("no master named `{master}` in this design"));
+            }
+            if !is_bump_master(&class) {
+                return Err(format!("{master} is `{class}`, not a COVER BUMP"));
+            }
+            Ok(db.inst_names().into_iter().filter(|i| db.inst_master(i) == master).collect())
+        } else {
+            let inst = opts.need("inst")?.to_string();
+            let master = db.inst_master(&inst);
+            if master.is_empty() {
+                return Err(format!("no instance named `{inst}` in this design"));
+            }
+            let class = db.master_get_type(&master).unwrap_or_default();
+            if !is_bump_master(&class) {
+                return Err(format!("{inst} is a `{class}` cell, not a bump"));
+            }
+            Ok(vec![inst])
+        }
+    })();
+
+    let chosen = match chosen {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !opts.dry_run {
+        for inst in &chosen {
+            if let Err(e) = db.destroy_inst(inst) {
+                eprintln!("vyges-pad: cannot remove {inst}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // Reported as `skipped` -- the field for instances named but not placed by this run.
+    finish(&opts, &mut db, "bump-removal", &[], &chosen)
+}
+
 fn make_io_sites(args: &[String]) -> ExitCode {
     let opts = match parse_opts(args) {
         Ok(o) => o,
@@ -753,6 +895,9 @@ fn main() -> ExitCode {
         Some("make-io-sites") => make_io_sites(&args[1..]),
         Some("place-corners") => place_corners(&args[1..]),
         Some("place-pad") => place_pad(&args[1..]),
+        Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
+        Some("remove-io-bump") => remove_io_bump(&args[1..], false),
+        Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),
         Some(other) => {
             eprintln!("vyges-pad: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)

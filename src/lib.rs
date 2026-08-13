@@ -6,6 +6,8 @@
 //!
 //! - **[`orient`]** — the eight orientations and how they compose. A ring is built by composing
 //!   them, so this is not a utility: get it backwards and every cell is wrong plausibly.
+//! - **[`bump`]** — the package connections over the die's face. Not part of the ring at all: a
+//!   lattice above the design, which is why a bump never blocks a placement by its box.
 //! - **[`clearance`]** — whether a cell may go somewhere, which is not a question about bounding
 //!   boxes: a dense ring is full of cells whose boxes overlap and whose metal does not.
 //! - **[`place`]** — putting cells into that ring: a corner at a row's own origin, a pad at a site
@@ -16,12 +18,14 @@
 //!
 //! Nothing in this module reads a database; the binary does that and hands values in.
 
+pub mod bump;
 pub mod clearance;
 pub mod orient;
 pub mod place;
 pub mod ring;
 
 pub use orient::Orient;
+pub use bump::{bumps, is_bump_master, Array, DEFAULT_PREFIX};
 pub use clearance::{intersects, outline_of, refuse, transform, Blocker, Refusal, Shape};
 pub use place::{
     corner_placement, corner_row_names, mirror_base, oriented_size, overlaps, place_in_row,
