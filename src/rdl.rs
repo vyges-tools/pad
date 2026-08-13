@@ -234,7 +234,12 @@ pub fn nearest_tracks(axis: &[i32], at: i32, usable: &dyn Fn(i32) -> bool) -> Ve
 /// every access point the terminal has and make the net unroutable.
 pub fn access_points(g: &Grid, target: &Target, obstructions: &[Rect], own: &[Rect]) -> Vec<Point> {
     let foreign = |r: &Rect| !own.contains(r);
-    let clear = |p: Point| !obstructions.iter().any(|r| foreign(r) && hits(p, p, *r));
+    // ⚠️ **No exemption here.** A candidate track is rejected if it lies inside ANY obstruction,
+    // the terminal's own metal included. The exemption applies only to the line test below. Excusing
+    // it here picks tracks inside the terminal's own pad, where every grid edge has been filtered
+    // away — the access points then attach to dead grid points and the terminal is unreachable,
+    // with four perfectly plausible-looking access points to show for it.
+    let clear = |p: Point| !obstructions.iter().any(|r| hits(p, p, *r));
     let mut out = Vec::new();
     for x in nearest_tracks(&g.x, target.centre.0, &|x| clear((x, target.centre.1))) {
         out.push((x, target.centre.1));
@@ -246,6 +251,173 @@ pub fn access_points(g: &Grid, target: &Target, obstructions: &[Rect], own: &[Re
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// The routing graph: points, and weighted neighbours.
+#[derive(Debug, Clone, Default)]
+pub struct Graph {
+    pub points: Vec<Point>,
+    pub index: std::collections::HashMap<Point, usize>,
+    pub adj: Vec<Vec<(usize, i64)>>,
+}
+
+impl Graph {
+    /// Build from a grid and the edges that survived obstruction filtering.
+    ///
+    /// ⚠️ Every grid point becomes a vertex, including points with no edges at all. The reference
+    /// does the same, and vertex numbering follows from it — x outer, y inner.
+    pub fn build(g: &Grid, edges: &[(Point, Point)], scale: f32) -> Graph {
+        let points: Vec<Point> = g.points().collect();
+        let index: std::collections::HashMap<Point, usize> =
+            points.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+        let mut adj = vec![Vec::new(); points.len()];
+        for &(a, b) in edges {
+            let (Some(&ia), Some(&ib)) = (index.get(&a), index.get(&b)) else { continue };
+            let w = edge_weight(a, b, scale);
+            adj[ia].push((ib, w));
+            adj[ib].push((ia, w));
+        }
+        Graph { points, index, adj }
+    }
+}
+
+impl Graph {
+    fn vertex(&mut self, p: Point) -> usize {
+        if let Some(&i) = self.index.get(&p) {
+            return i;
+        }
+        let i = self.points.len();
+        self.points.push(p);
+        self.index.insert(p, i);
+        self.adj.push(Vec::new());
+        i
+    }
+
+    fn join(&mut self, a: usize, b: usize, w: i64) {
+        if a != b && !self.adj[a].iter().any(|&(v, _)| v == b) {
+            self.adj[a].push((b, w));
+            self.adj[b].push((a, w));
+        }
+    }
+
+    fn cut(&mut self, a: usize, b: usize) {
+        self.adj[a].retain(|&(v, _)| v != b);
+        self.adj[b].retain(|&(v, _)| v != a);
+    }
+}
+
+/// **G12** — graft a terminal onto the grid.
+///
+/// A snap point lies **on** a grid line but between two grid points, so it splits the edge it sits
+/// on: that edge is removed, the snap becomes a vertex joined to both former endpoints, and it is
+/// joined to the terminal's centre.
+///
+/// ⚠️ The centre-to-snap edge is added **without an obstruction check**. It runs through the
+/// terminal's own pin metal by construction, and checking it would refuse every terminal.
+pub fn insert_access(graph: &mut Graph, g: &Grid, centre: Point, snaps: &[Point]) {
+    let c = graph.vertex(centre);
+    for &snap in snaps {
+        // The two grid points this snap sits between, on its own line.
+        let between = if g.x.binary_search(&snap.0).is_ok() {
+            // On a grid column: the neighbours are above and below in y.
+            let below = g.y.iter().copied().filter(|&y| y < snap.1).next_back();
+            let above = g.y.iter().copied().find(|&y| y > snap.1);
+            (below.map(|y| (snap.0, y)), above.map(|y| (snap.0, y)))
+        } else {
+            let left = g.x.iter().copied().filter(|&x| x < snap.0).next_back();
+            let right = g.x.iter().copied().find(|&x| x > snap.0);
+            (left.map(|x| (x, snap.1)), right.map(|x| (x, snap.1)))
+        };
+
+        let ends: Vec<usize> = [between.0, between.1]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| graph.index.get(&p).copied())
+            .collect();
+        if let [a, b] = ends[..] {
+            graph.cut(a, b);
+        }
+        let sv = graph.vertex(snap);
+        graph.join(sv, c, edge_weight(snap, centre, 1.0));
+        for &e in &ends {
+            let w = edge_weight(snap, graph.points[e], 1.0);
+            graph.join(sv, e, w);
+        }
+    }
+}
+
+/// **G11** — the cheapest route between two points.
+///
+/// A\* with a **path-dependent** heuristic: the estimate for a vertex includes a penalty when
+/// arriving there would turn, and "would turn" is judged from the predecessor recorded *so far*.
+///
+/// ⚠️ That makes the heuristic inadmissible and the search order significant — this mirrors the
+/// reference's tree search, which keeps no closed set and may re-expand a vertex when a cheaper
+/// way to it turns up. A textbook A\* with a closed set finds a path of the same cost and not
+/// necessarily the same path.
+pub fn shortest_path(
+    graph: &Graph,
+    start: Point,
+    goal: Point,
+    turn_penalty: f32,
+) -> Vec<Point> {
+    let (Some(&s), Some(&t)) = (graph.index.get(&start), graph.index.get(&goal)) else {
+        return Vec::new();
+    };
+    let n = graph.points.len();
+    let mut dist = vec![i64::MAX; n];
+    let mut prev = vec![usize::MAX; n];
+    let mut heap = std::collections::BinaryHeap::new();
+
+    let heuristic = |v: usize, prev: &[usize]| -> i64 {
+        let pt = graph.points[v];
+        let base = distance(goal, pt);
+        let c = prev[v];
+        if c == usize::MAX || c == s {
+            return base;
+        }
+        let b = prev[c];
+        if b == usize::MAX || b == s {
+            return base;
+        }
+        let (pc, pb) = (graph.points[c], graph.points[b]);
+        let incoming = (pc.0 - pb.0, pc.1 - pb.1);
+        let outgoing = (pt.0 - pc.0, pt.1 - pc.1);
+        if incoming == outgoing {
+            base
+        } else {
+            base + (turn_penalty * distance(pb, pc) as f32) as i64
+        }
+    };
+
+    dist[s] = 0;
+    prev[s] = s;
+    // Ordered by (f, vertex) with the sign flipped, so the smallest f leaves first and equal
+    // costs are settled by vertex number rather than by whichever happened to be pushed first.
+    heap.push((std::cmp::Reverse(heuristic(s, &prev)), std::cmp::Reverse(s)));
+
+    while let Some((std::cmp::Reverse(_), std::cmp::Reverse(u))) = heap.pop() {
+        if u == t {
+            let mut path = vec![graph.points[u]];
+            let mut v = u;
+            while prev[v] != v {
+                v = prev[v];
+                path.push(graph.points[v]);
+            }
+            path.reverse();
+            return path;
+        }
+        for &(v, w) in &graph.adj[u] {
+            let candidate = dist[u].saturating_add(w);
+            if candidate < dist[v] {
+                dist[v] = candidate;
+                prev[v] = u;
+                let f = candidate.saturating_add(heuristic(v, &prev));
+                heap.push((std::cmp::Reverse(f), std::cmp::Reverse(v)));
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -313,6 +485,42 @@ mod tests {
     }
 
     #[test]
+    fn a_path_is_found_across_a_small_grid() {
+        let coords: Vec<i32> = (0..5).map(|i| 10 + i * 100).collect();
+        let g = grid(&coords, &coords, 4, 4);
+        let graph = Graph::build(&g, &edges(&g, false), 1.0);
+        let path = shortest_path(&graph, (10, 10), (410, 410), 2.0);
+        assert!(!path.is_empty(), "a clear grid must be crossable");
+        assert_eq!(path.first(), Some(&(10, 10)));
+        assert_eq!(path.last(), Some(&(410, 410)));
+        // Monotone staircase: 4 steps in each axis, so 9 points.
+        assert_eq!(path.len(), 9, "no wandering");
+    }
+
+    #[test]
+    fn a_path_routes_around_a_wall() {
+        let coords: Vec<i32> = (0..5).map(|i| 10 + i * 100).collect();
+        let g = grid(&coords, &coords, 4, 4);
+        // A wall across the middle column, open at the top.
+        let wall = [(150, 0, 170, 350)];
+        let e = edges_clear(&g, false, &|a, b| blocked(a, b, &wall));
+        let graph = Graph::build(&g, &e, 1.0);
+        let path = shortest_path(&graph, (10, 10), (410, 10), 2.0);
+        assert!(!path.is_empty(), "must go around");
+        assert!(path.iter().any(|p| p.1 >= 310), "detoured over the wall");
+    }
+
+    #[test]
+    fn an_unreachable_goal_gives_no_path() {
+        let coords: Vec<i32> = (0..5).map(|i| 10 + i * 100).collect();
+        let g = grid(&coords, &coords, 4, 4);
+        let wall = [(150, -100, 170, 1000)];
+        let e = edges_clear(&g, false, &|a, b| blocked(a, b, &wall));
+        let graph = Graph::build(&g, &e, 1.0);
+        assert!(shortest_path(&graph, (10, 10), (410, 10), 2.0).is_empty());
+    }
+
+    #[test]
     fn the_nearest_track_on_each_side_is_taken() {
         let axis = [0, 10, 20, 30, 40];
         assert_eq!(nearest_tracks(&axis, 25, &|_| true), vec![20, 30]);
@@ -343,19 +551,28 @@ mod tests {
     }
 
     #[test]
-    fn a_targets_own_metal_does_not_block_its_access() {
+    fn a_targets_own_metal_does_not_block_the_line_to_its_access() {
         // ⚠️ The target sits inside its own pin, so every access line starts inside it. Counting
         // that as a violation leaves the terminal with no way in at all.
         let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
         let own = (140, 140, 160, 160);
-        let t = Target {
-            terminal: "u/PAD".into(),
-            centre: (150, 150),
-            shape: own,
-            access: vec![],
-        };
+        let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![] };
         assert_eq!(access_points(&g, &t, &[own], &[own]).len(), 4);
         assert!(access_points(&g, &t, &[own], &[]).is_empty(), "not excused, none survive");
+    }
+
+    #[test]
+    fn a_candidate_track_inside_any_obstruction_is_rejected_even_the_targets_own() {
+        // ⚠️ The asymmetry that matters: the exemption applies to the LINE, never to the
+        // candidate. A track inside the terminal's own pad is dead grid — every edge there was
+        // filtered out — so accepting it yields access points that reach nothing.
+        let g = Grid { x: vec![0, 100, 200, 300], y: vec![150] };
+        let own = (90, 140, 210, 160);
+        let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![] };
+        let pts = access_points(&g, &t, &[own], &[own]);
+        assert!(!pts.contains(&(100, 150)), "inside the pad, rejected as a candidate");
+        assert!(!pts.contains(&(200, 150)), "likewise");
+        assert!(pts.contains(&(0, 150)) && pts.contains(&(300, 150)), "the live tracks outside");
     }
 
     #[test]

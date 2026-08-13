@@ -931,6 +931,50 @@ fn rdl_route(args: &[String]) -> ExitCode {
         total_targets += t.len();
         target_report.push_str(&format!("{n} has {} targets\n", iterms.len()));
     }
+    // A single route attempt, for checking the search against the reference's own path length.
+    if let Some(spec) = opts.get("probe") {
+        let n: Vec<i32> = spec.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        let [sx, sy, tx, ty] = n[..] else {
+            eprintln!("vyges-pad: --probe wants `sx sy tx ty`");
+            return ExitCode::from(2);
+        };
+        let turn = opts.get("turn-penalty").and_then(|v| v.parse().ok()).unwrap_or(2.0f32);
+        let mut graph = rdl::Graph::build(&g, &clear, 1.0);
+        // Graft both terminals onto the grid, as the reference does before each attempt.
+        for centre in [(sx, sy), (tx, ty)] {
+            let own: Vec<(i32, i32, i32, i32)> = obstructions
+                .iter()
+                .copied()
+                .filter(|r| rdl::hits(centre, centre, *r))
+                .collect();
+            let t = rdl::Target {
+                terminal: String::new(),
+                centre,
+                shape: (centre.0, centre.1, centre.0, centre.1),
+                access: Vec::new(),
+            };
+            let snaps = rdl::access_points(&g, &t, &obstructions, &own);
+            rdl::insert_access(&mut graph, &g, centre, &snaps);
+        }
+        let path = rdl::shortest_path(&graph, (sx, sy), (tx, ty), turn);
+        println!("{{\"segments\": {}}}", path.len());
+        for p in &path {
+            eprintln!("  {} {}", p.0, p.1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(path) = opts.get("net-centre-report") {
+        let mut body = String::new();
+        for n in &nets {
+            for t in rdl_targets(&db, n, &layer) {
+                body.push_str(&format!("{n} {} {} {}\n", t.centre.0, t.centre.1, t.terminal));
+            }
+        }
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
     if let Some(path) = opts.get("centre-report") {
         let mut all = std::collections::BTreeSet::new();
         for n in &nets {
