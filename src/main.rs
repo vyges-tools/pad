@@ -932,6 +932,75 @@ fn rdl_route(args: &[String]) -> ExitCode {
         total_targets += t.len();
         target_report.push_str(&format!("{n} has {} targets\n", iterms.len()));
     }
+    // The order routes would be attempted in, for checking the queue against the reference.
+    if let Some(path) = opts.get("order-report") {
+        let mut routes: Vec<rdl::Route> = Vec::new();
+        let mut ties = 0usize;
+        for (i, n) in nets.iter().enumerate() {
+            let targets = rdl_targets(&db, n, &layer);
+            // One destination per terminal, at its first target's centre.
+            let mut seen = std::collections::BTreeSet::new();
+            let mut dests = Vec::new();
+            for t in &targets {
+                if !seen.insert(t.terminal.clone()) {
+                    continue;
+                }
+                let inst = t.terminal.rsplit_once('/').map(|(a, _)| a).unwrap_or("").to_string();
+                let cover = db.master_is_cover(&db.inst_get_master(&inst));
+                dests.push(rdl::Dest {
+                    terminal: t.terminal.clone(),
+                    instance: inst,
+                    centre: t.centre,
+                    cover,
+                    // ⚠️ A stand-in for odb's object id, which is not reachable across the
+                    // bridge. It only decides exact ties, and the tie count below says whether
+                    // any were hit.
+                    id: (i * 1000 + dests.len()) as u64,
+                });
+            }
+            for d in dests.clone() {
+                if !d.cover {
+                    continue;
+                }
+                let ordered = rdl::order_dests(&d.instance, d.centre, &dests);
+                if ordered.is_empty() {
+                    continue;
+                }
+                routes.push(rdl::Route {
+                    source: d.terminal.clone(),
+                    instance: d.instance.clone(),
+                    centre: d.centre,
+                    id: d.id,
+                    dests: ordered,
+                    next: 0,
+                    priority: 0,
+                    routed: false,
+                });
+            }
+        }
+        routes.sort_by(|a, b| {
+            let o = a.precedes(b);
+            if o == std::cmp::Ordering::Equal {
+                ties += 1;
+            }
+            o
+        });
+        let body: String = routes
+            .iter()
+            .take(40)
+            .map(|r| {
+                let d = r.peek().unwrap();
+                format!("{} {} -> {} {}\n", r.centre.0, r.centre.1, d.centre.0, d.centre.1)
+            })
+            .collect();
+        eprintln!("routes: {}  ordering ties hit: {ties}", routes.len());
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // A single route attempt, for checking the search against the reference's own path length.
     if let Some(spec) = opts.get("probe") {
         let n: Vec<i32> = spec.split_whitespace().filter_map(|t| t.parse().ok()).collect();

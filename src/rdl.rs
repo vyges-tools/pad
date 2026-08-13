@@ -519,6 +519,95 @@ pub fn wires(route: &[Point], width: i32, source: Rect, target: Rect) -> Vec<Wir
         .collect()
 }
 
+/// A destination a route may connect to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dest {
+    pub terminal: String,
+    pub instance: String,
+    pub centre: Point,
+    pub cover: bool,
+    pub id: u64,
+}
+
+/// One routing job: a bump terminal and the terminals it may reach, in attempt order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    pub source: String,
+    pub instance: String,
+    pub centre: Point,
+    pub id: u64,
+    pub dests: Vec<Dest>,
+    pub next: usize,
+    pub priority: i32,
+    pub routed: bool,
+}
+
+/// Squared distance — exact in integers, and all the ordering rules need.
+fn squared(a: Point, b: Point) -> i64 {
+    let (dx, dy) = ((a.0 - b.0) as i64, (a.1 - b.1) as i64);
+    dx * dx + dy * dy
+}
+
+/// **R1** — the order a route tries its destinations in.
+///
+/// Destinations on the **same instance** as the source are dropped: a bump does not route to
+/// itself. What remains is sorted **non-cover first**, then by distance, then by terminal id.
+///
+/// ⚠️ Non-cover first means a bump prefers a *pad* over another bump even when the other bump is
+/// nearer. Sorting purely by distance chains bumps to each other and leaves the pads unreached.
+pub fn order_dests(source_instance: &str, source_centre: Point, dests: &[Dest]) -> Vec<Dest> {
+    let mut out: Vec<Dest> =
+        dests.iter().filter(|d| d.instance != source_instance).cloned().collect();
+    out.sort_by(|a, b| {
+        (a.cover, squared(source_centre, a.centre), a.id)
+            .cmp(&(b.cover, squared(source_centre, b.centre), b.id))
+    });
+    out
+}
+
+impl Route {
+    pub fn has_next(&self) -> bool {
+        self.next < self.dests.len()
+    }
+
+    pub fn peek(&self) -> Option<&Dest> {
+        self.dests.get(self.next)
+    }
+
+    /// **R2** — which of two routes is attempted first.
+    ///
+    /// Higher **priority** first — priority only rises when a route is ripped up, so a route that
+    /// has been displaced gets another go before anything new is tried. Among equals, the
+    /// **shortest** next connection first. A tie on distance is settled by terminal id.
+    ///
+    /// ⚠️ A route with no destinations left is ordered by priority alone; asking it for a distance
+    /// would read past the end of its list.
+    pub fn precedes(&self, other: &Route) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.priority != other.priority {
+            return other.priority.cmp(&self.priority);
+        }
+        let (Some(a), Some(b)) = (self.peek(), other.peek()) else {
+            return Ordering::Equal;
+        };
+        let (da, db) = (squared(self.centre, a.centre), squared(other.centre, b.centre));
+        match da.cmp(&db) {
+            Ordering::Equal => other.id.cmp(&self.id),
+            o => o,
+        }
+    }
+}
+
+/// **R3** — the corridor a committed route takes out of the graph.
+///
+/// Every edge touching a route vertex goes, and so does every edge crossing the box of
+/// `width / 2 + spacing + 1` around each vertex. ⚠️ The `+ 1` is the reference's, and it is what
+/// leaves a wire one unit clear of its neighbours rather than exactly touching them.
+pub fn commit_corridor(route: &[Point], width: i32, spacing: i32) -> Vec<Rect> {
+    let d = width / 2 + spacing + 1;
+    route.iter().map(|&(x, y)| (x - d, y - d, x + d, y + d)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +670,80 @@ mod tests {
         assert!(with45 > plain, "diagonals were added");
         // Nine diagonals from the four even-even positions of a 4 x 4 grid, once each.
         assert_eq!(with45 - plain, 9, "half-density diagonal mesh");
+    }
+
+    fn dest(name: &str, inst: &str, c: Point, cover: bool, id: u64) -> Dest {
+        Dest { terminal: name.into(), instance: inst.into(), centre: c, cover, id }
+    }
+
+    fn route(c: Point, id: u64, dests: Vec<Dest>) -> Route {
+        Route {
+            source: "BUMP/PAD".into(),
+            instance: "BUMP".into(),
+            centre: c,
+            id,
+            dests,
+            next: 0,
+            priority: 0,
+            routed: false,
+        }
+    }
+
+    #[test]
+    fn a_pad_is_preferred_over_a_nearer_bump() {
+        // ⚠️ The rule that stops bumps chaining to each other and leaving pads unreached.
+        let ds = vec![
+            dest("B/PAD", "B", (10, 0), true, 1),
+            dest("P/PAD", "P", (1000, 0), false, 2),
+        ];
+        let ordered = order_dests("BUMP", (0, 0), &ds);
+        assert_eq!(ordered[0].terminal, "P/PAD", "the far pad comes before the near bump");
+    }
+
+    #[test]
+    fn destinations_on_the_source_instance_are_dropped() {
+        let ds = vec![dest("BUMP/OTHER", "BUMP", (10, 0), true, 1)];
+        assert!(order_dests("BUMP", (0, 0), &ds).is_empty(), "a bump does not route to itself");
+    }
+
+    #[test]
+    fn equal_kind_destinations_go_nearest_first_then_by_id() {
+        let ds = vec![
+            dest("c", "C", (30, 0), false, 3),
+            dest("a", "A", (10, 0), false, 9),
+            dest("b", "B", (10, 0), false, 4),
+        ];
+        let ordered = order_dests("S", (0, 0), &ds);
+        let names: Vec<&str> = ordered.iter().map(|d| d.terminal.as_str()).collect();
+        assert_eq!(names, vec!["b", "a", "c"], "distance first, then id");
+    }
+
+    #[test]
+    fn a_ripped_up_route_is_retried_before_anything_new() {
+        let far = route((0, 0), 1, vec![dest("p", "P", (10_000, 0), false, 1)]);
+        let mut near = route((0, 0), 2, vec![dest("q", "Q", (10, 0), false, 2)]);
+        // Normally the near one wins.
+        assert_eq!(near.precedes(&far), std::cmp::Ordering::Less);
+        // ⚠️ Priority overrides distance entirely, which is what makes rip-up converge.
+        near.priority = 0;
+        let mut bumped = far.clone();
+        bumped.priority = 1;
+        assert_eq!(bumped.precedes(&near), std::cmp::Ordering::Less, "priority wins");
+    }
+
+    #[test]
+    fn a_route_with_nothing_left_to_try_is_ordered_by_priority_alone() {
+        // ⚠️ Reading a distance here would run past the end of the destination list.
+        let empty = route((0, 0), 1, vec![]);
+        let other = route((0, 0), 2, vec![dest("p", "P", (10, 0), false, 1)]);
+        assert_eq!(empty.precedes(&other), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn a_committed_route_clears_a_corridor_around_itself() {
+        let boxes = commit_corridor(&[(100, 100)], 80, 20);
+        // ⚠️ half-width + spacing + 1 = 61, not 60: one unit clear, not exactly touching.
+        assert_eq!(boxes, vec![(39, 39, 161, 161)]);
     }
 
     #[test]
