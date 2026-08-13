@@ -253,19 +253,43 @@ fn read_row(db: &Db, name: &str) -> Option<RowGeom> {
 /// ℹ️ Nets are not carried. The reference lets two shapes on the SAME net touch; a corner being
 /// created has no nets at all, so every shared-layer overlap is a conflict for it either way. A
 /// command that places cells already connected to nets would need them.
-fn cell_shapes(db: &Db, master: &str, orient: Orient, at: (i32, i32)) -> Vec<Shape> {
+fn cell_shapes(db: &Db, inst: &str, master: &str, orient: Orient, at: (i32, i32)) -> Vec<Shape> {
     let (mw, mh) = match master_size(db, master) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
-    for src in [db.master_obstruction_boxes(master), db.master_pin_boxes(master)] {
-        for (layer, x0, y0, x1, y1) in src.unwrap_or_default() {
-            out.push(Shape {
-                layer: db.layer_name_by_number(layer),
-                rect: transform((x0, y0, x1, y1), (mw, mh), orient, at),
-                net: None,
-            });
+    let mut push = |layer: i64, r: Rect, net: Option<String>| {
+        out.push(Shape {
+            layer: db.layer_name_by_number(layer),
+            rect: transform(r, (mw, mh), orient, at),
+            net,
+        })
+    };
+
+    // A master's own obstructions belong to no terminal, so they belong to no net.
+    for (layer, x0, y0, x1, y1) in db.master_obstruction_boxes(master).unwrap_or_default() {
+        push(layer, (x0, y0, x1, y1), None);
+    }
+
+    // ⚠️ **Per terminal, so each shape keeps the net it is on.** Taking every pin box in one go
+    // loses which terminal a shape came from, and with it the net — and a shape with no net can
+    // never match another, so the cell is refused wherever its metal meets anything. That is
+    // exactly wrong for a bump sitting over the pad it serves: they are on the same net, they are
+    // *meant* to touch, and the reference lets them.
+    let terms = db.iterm_names(inst);
+    if terms.is_empty() {
+        // The instance does not exist yet — a cell about to be created has no connections.
+        for (layer, x0, y0, x1, y1) in db.master_pin_boxes(master).unwrap_or_default() {
+            push(layer, (x0, y0, x1, y1), None);
+        }
+        return out;
+    }
+    for term in terms {
+        let net = db.net_of(inst, &term);
+        let net = (!net.is_empty()).then_some(net);
+        for (layer, x0, y0, x1, y1) in db.mterm_pin_boxes(master, &term).unwrap_or_default() {
+            push(layer, (x0, y0, x1, y1), net.clone());
         }
     }
     out
@@ -323,7 +347,7 @@ fn blockers(db: &Db, skip: &str) -> Vec<Blocker> {
         let is_cover =
             db.master_get_type(&master).unwrap_or_default().starts_with("COVER");
         let orient = Orient::parse(&db.inst_get_orient(&name)).unwrap_or(Orient::R0);
-        let shapes = cell_shapes(db, &master, orient, (x0, y0));
+        let shapes = cell_shapes(db, &name, &master, orient, (x0, y0));
         out.push(Blocker {
             name,
             bbox: (x0, y0, x1, y1),
@@ -424,7 +448,7 @@ fn place_corners(args: &[String]) -> ExitCode {
         let p = corner_placement(&row, &master);
         let (dx, dy) = oriented_size(size.0, size.1, p.orient);
         let bbox = (p.x, p.y, p.x + dx, p.y + dy);
-        let shapes = cell_shapes(&db, &master, p.orient, (p.x, p.y));
+        let shapes = cell_shapes(&db, &p.name, &master, p.orient, (p.x, p.y));
         let outline = cell_outline(&db, &shapes);
         if let Some(why) = refuse(
             &p.name,
@@ -2043,8 +2067,15 @@ fn place_bump_aligned(
     let mut out = Vec::new();
     let mut k = 0usize;
 
+    // ⚠️ Shaped like the reference's own `Place` debug output so the two can be diffed line for
+    // line. Set `VYGES_PAD_TRACE=*` and run the reference with `-debug PAD Place 1`.
+    let trace = std::env::var("VYGES_PAD_TRACE").is_ok_and(|v| v == "*");
+
     while k < pads.len() {
         let group = alignment_group(aligned, k, offset, row_centre, horizontal);
+        if trace {
+            eprintln!("Pad group size {}", group.len());
+        }
         // A pad with no bump simply takes the next place going.
         let wanted: Vec<(usize, i32)> = if group.is_empty() {
             vec![(k, 0)]
@@ -2055,6 +2086,12 @@ fn place_bump_aligned(
         for (i, want) in wanted {
             let (at, left) = travel(offset, want, budget);
             budget = left;
+            if trace {
+                eprintln!(
+                    "Placing {} at {}um with a remaining spare gap {}um (want {}, offset {})",
+                    pads[i].name, at, budget, want, offset
+                );
+            }
             let p = place_one(
                 track,
                 track.snap_to_site(at),
@@ -2152,15 +2189,22 @@ fn place_pads(args: &[String]) -> ExitCode {
     let stops = blockages(&db);
     let shapes_at = |name: &str, bbox: (i32, i32, i32, i32), orient: Orient| {
         let master = db.inst_get_master(name);
-        let shapes = cell_shapes(&db, &master, orient, (bbox.0, bbox.1));
+        let shapes = cell_shapes(&db, name, &master, orient, (bbox.0, bbox.1));
         let outline = cell_outline(&db, &shapes);
         (shapes, outline)
     };
+    let trace_checks = std::env::var("VYGES_PAD_TRACE").is_ok_and(|v| v == "*");
     let mut conflict = |name: &str, bbox: (i32, i32, i32, i32), orient: Orient| {
         let (shapes, outline) = shapes_at(name, bbox, orient);
-        refuse(name, bbox, &outline, &shapes, &fixed.borrow(), &stops, &|l| {
+        let out = refuse(name, bbox, &outline, &shapes, &fixed.borrow(), &stops, &|l| {
             db.layer_get_spacing(l)
-        })
+        });
+        if trace_checks {
+            if let Some(r) = &out {
+                eprintln!("  {name} at {bbox:?} blocked: {:?} by {:?}", r.reason, r.blocker);
+            }
+        }
+        out
     };
     let mut settle = |p: &Placement| {
         let (dx, dy) = oriented_size_of(&db, &p.master, p.orient);
