@@ -436,6 +436,101 @@ pub fn commit_route(graph: &mut Graph, route: &[Point], width: i32, spacing: i32
     undo
 }
 
+/// A 4-ary min-heap keyed on cost alone, matching the reference's queue element for element.
+///
+/// ⚠️ **The key is the cost and nothing else.** Adding the vertex as a secondary key — the obvious
+/// way to make the order deterministic — gives a *different* deterministic order, and among
+/// equal-cost paths the search then returns a different one. The tie is settled by where an entry
+/// lands in the array, so the array's exact shape is the answer rather than a detail of it.
+#[derive(Default)]
+struct CostHeap {
+    data: Vec<(i64, usize)>,
+}
+
+impl CostHeap {
+    const ARITY: usize = 4;
+
+    fn parent(i: usize) -> usize {
+        (i - 1) / Self::ARITY
+    }
+
+    fn first_child(i: usize) -> usize {
+        i * Self::ARITY + 1
+    }
+
+    fn push(&mut self, v: (i64, usize)) {
+        self.data.push(v);
+        self.sift_up(self.data.len() - 1);
+    }
+
+    fn pop(&mut self) -> Option<(i64, usize)> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let top = self.data[0];
+        if self.data.len() == 1 {
+            self.data.pop();
+        } else {
+            self.data[0] = *self.data.last().unwrap();
+            self.data.pop();
+            self.sift_down();
+        }
+        Some(top)
+    }
+
+    /// ⚠️ Strictly less than the parent moves up; **equal stays put**. That single `<` is what
+    /// decides which of two equal-cost routes the search settles on.
+    fn sift_up(&mut self, orig: usize) {
+        if orig == 0 {
+            return;
+        }
+        let moving = self.data[orig];
+        let mut index = orig;
+        let mut levels = 0;
+        while index != 0 {
+            let p = Self::parent(index);
+            if moving.0 < self.data[p].0 {
+                levels += 1;
+                index = p;
+            } else {
+                break;
+            }
+        }
+        let mut index = orig;
+        for _ in 0..levels {
+            let p = Self::parent(index);
+            self.data[index] = self.data[p];
+            index = p;
+        }
+        self.data[index] = moving;
+    }
+
+    /// ⚠️ Among equal children the **first** wins: the scan replaces only on strictly less.
+    fn sift_down(&mut self) {
+        let mut index = 0usize;
+        let size = self.data.len();
+        loop {
+            let first = Self::first_child(index);
+            if first >= size {
+                break;
+            }
+            let last = (first + Self::ARITY).min(size);
+            let mut best = first;
+            for i in (first + 1)..last {
+                if self.data[i].0 < self.data[best].0 {
+                    best = i;
+                }
+            }
+            if self.data[best].0 < self.data[index].0 {
+                self.data.swap(best, index);
+                index = best;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// **G11** — the cheapest route between two points.
 ///
 /// A\* with a **path-dependent** heuristic: the estimate for a vertex includes a penalty when
@@ -457,7 +552,7 @@ pub fn shortest_path(
     let n = graph.points.len();
     let mut dist = vec![i64::MAX; n];
     let mut prev = vec![usize::MAX; n];
-    let mut heap = std::collections::BinaryHeap::new();
+    let mut heap = CostHeap::default();
 
     let heuristic = |v: usize, prev: &[usize]| -> i64 {
         let pt = graph.points[v];
@@ -484,9 +579,9 @@ pub fn shortest_path(
     prev[s] = s;
     // Ordered by (f, vertex) with the sign flipped, so the smallest f leaves first and equal
     // costs are settled by vertex number rather than by whichever happened to be pushed first.
-    heap.push((std::cmp::Reverse(heuristic(s, &prev)), std::cmp::Reverse(s)));
+    heap.push((heuristic(s, &prev), s));
 
-    while let Some((std::cmp::Reverse(_), std::cmp::Reverse(u))) = heap.pop() {
+    while let Some((_, u)) = heap.pop() {
         if u == t {
             let mut path = vec![graph.points[u]];
             let mut v = u;
@@ -503,7 +598,7 @@ pub fn shortest_path(
                 dist[v] = candidate;
                 prev[v] = u;
                 let f = candidate.saturating_add(heuristic(v, &prev));
-                heap.push((std::cmp::Reverse(f), std::cmp::Reverse(v)));
+                heap.push((f, v));
             }
         }
     }
