@@ -420,6 +420,105 @@ pub fn shortest_path(
     Vec::new()
 }
 
+/// A wire piece: a rectangle for a straight run, or a 45-degree centre line with a width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    Straight(Rect),
+    Diagonal(Point, Point, i32),
+}
+
+fn direction(s: Point, t: Point) -> u8 {
+    if s.1 == t.1 {
+        0
+    } else if s.0 == t.0 {
+        1
+    } else if (s.0 < t.0) == (s.1 < t.1) {
+        2
+    } else {
+        3
+    }
+}
+
+/// **G13** — collapse a grid path into straight runs, mitring the corners.
+///
+/// Consecutive points going the same way become one run. ⚠️ At a right-angle turn both runs are
+/// **extended by half the wire width** — the incoming one ends half a width *past* the corner and
+/// the outgoing one starts half a width *back*. Without it the two rectangles meet corner to
+/// corner and leave a notch of bare substrate on the inside of every bend.
+pub fn simplify(route: &[Point], width: i32) -> Vec<(Point, Point)> {
+    if route.len() < 2 {
+        return Vec::new();
+    }
+    let ext = width / 2;
+    let mut wire = vec![(route[0], route[1])];
+    let mut dir = direction(route[0], route[1]);
+    for &t in &route[2..] {
+        let mut s = wire.last().unwrap().1;
+        let seg = direction(s, t);
+        if seg == dir {
+            wire.last_mut().unwrap().1 = t;
+            continue;
+        }
+        if dir == 0 && seg == 1 {
+            let prev = wire.last().unwrap().0;
+            wire.last_mut().unwrap().1.0 = if prev.0 < s.0 { s.0 + ext } else { s.0 - ext };
+            s.1 = if s.1 < t.1 { s.1 - ext } else { s.1 + ext };
+        } else if dir == 1 && seg == 0 {
+            let prev = wire.last().unwrap().0;
+            wire.last_mut().unwrap().1.1 = if prev.1 < s.1 { s.1 + ext } else { s.1 - ext };
+            s.0 = if s.0 < t.0 { s.0 - ext } else { s.0 + ext };
+        }
+        wire.push((s, t));
+        dir = seg;
+    }
+    wire
+}
+
+/// **G14** — a straight run's rectangle: the segment, widened sideways only.
+pub fn run_rect(s: Point, t: Point, width: i32) -> Rect {
+    let half = width / 2;
+    if s.0 == t.0 {
+        (s.0 - half, s.1.min(t.1), s.0 + half, s.1.max(t.1))
+    } else {
+        (s.0.min(t.0), s.1 - half, s.0.max(t.0), s.1 + half)
+    }
+}
+
+/// **G15** — make the first and last run reach right into the pad it serves.
+///
+/// ⚠️ Only when the run is **wider across** than the target it lands on. A run no wider than the
+/// pad is already covered by it, and merging then would stretch the wire to the pad's far edge for
+/// no reason.
+pub fn correct_end(run: Rect, horizontal: bool, target: Rect) -> Rect {
+    let across = |r: Rect| if horizontal { r.3 - r.1 } else { r.2 - r.0 };
+    if across(run) <= across(target) {
+        return run;
+    }
+    (run.0.min(target.0), run.1.min(target.1), run.2.max(target.2), run.3.max(target.3))
+}
+
+/// **G16** — the wire pieces for one routed path.
+pub fn wires(route: &[Point], width: i32, source: Rect, target: Rect) -> Vec<Wire> {
+    let runs = simplify(route, width);
+    let last = runs.len().saturating_sub(1);
+    runs.iter()
+        .enumerate()
+        .map(|(i, &(s, t))| {
+            if s.0 != t.0 && s.1 != t.1 {
+                return Wire::Diagonal(s, t, width);
+            }
+            let mut r = run_rect(s, t, width);
+            let horizontal = s.1 == t.1;
+            if i == 0 {
+                r = correct_end(r, horizontal, source);
+            } else if i == last {
+                r = correct_end(r, horizontal, target);
+            }
+            Wire::Straight(r)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +581,50 @@ mod tests {
         assert!(with45 > plain, "diagonals were added");
         // Nine diagonals from the four even-even positions of a 4 x 4 grid, once each.
         assert_eq!(with45 - plain, 9, "half-density diagonal mesh");
+    }
+
+    #[test]
+    fn a_straight_run_collapses_to_one_segment() {
+        let path = [(0, 0), (0, 100), (0, 200), (0, 300)];
+        assert_eq!(simplify(&path, 80), vec![((0, 0), (0, 300))]);
+    }
+
+    #[test]
+    fn a_corner_is_mitred_by_half_the_wire_width() {
+        // ⚠️ Both runs reach past the corner. Without it the rectangles meet corner to corner and
+        // leave a notch of bare substrate on the inside of the bend.
+        let path = [(0, 0), (0, 100), (100, 100)];
+        let runs = simplify(&path, 80);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], ((0, 0), (0, 140)), "the vertical run overshoots by 40");
+        assert_eq!(runs[1], ((-40, 100), (100, 100)), "the horizontal starts 40 back");
+    }
+
+    #[test]
+    fn a_diagonal_is_kept_as_a_centre_line() {
+        let path = [(0, 0), (100, 100)];
+        let w = wires(&path, 80, (0, 0, 0, 0), (0, 0, 0, 0));
+        assert_eq!(w, vec![Wire::Diagonal((0, 0), (100, 100), 80)]);
+    }
+
+    #[test]
+    fn a_run_is_widened_sideways_only() {
+        assert_eq!(run_rect((0, 0), (0, 300), 80), (-40, 0, 40, 300));
+        assert_eq!(run_rect((0, 0), (300, 0), 80), (0, -40, 300, 40));
+        // ⚠️ Not bloated along its own length: a wire is as long as its path, no longer.
+    }
+
+    #[test]
+    fn an_end_run_reaches_into_a_pad_only_when_it_is_wider_than_it() {
+        let run = (0, -40, 300, 40); // 80 across
+        // A wider pad already covers it: leave the run alone.
+        assert_eq!(correct_end(run, true, (280, -100, 340, 100)), run);
+        // A narrower pad does not: stretch to cover it.
+        assert_eq!(
+            correct_end(run, true, (280, -20, 340, 20)),
+            (0, -40, 340, 40),
+            "reaches the pad's far edge"
+        );
     }
 
     #[test]

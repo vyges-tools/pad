@@ -167,6 +167,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--allow45" => o.keys.push(("allow45".into(), "1".into())),
             "--fixed" => o.keys.push(("fixed".into(), "1".into())),
             "--grid-only" => o.keys.push(("grid-only".into(), "1".into())),
+            "--wires" => o.keys.push(("wires".into(), "1".into())),
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -958,8 +959,26 @@ fn rdl_route(args: &[String]) -> ExitCode {
         }
         let path = rdl::shortest_path(&graph, (sx, sy), (tx, ty), turn);
         println!("{{\"segments\": {}}}", path.len());
-        for p in &path {
-            eprintln!("  {} {}", p.0, p.1);
+        if opts.get("wires").is_some() {
+            // The pin rectangles the two ends land on, so the end runs can reach into them.
+            let shape_of = |c: (i32, i32)| {
+                nets.iter()
+                    .flat_map(|n| rdl_targets(&db, n, &layer))
+                    .find(|t| t.centre == c)
+                    .map(|t| t.shape)
+                    .unwrap_or((c.0, c.1, c.0, c.1))
+            };
+            let w = to_dbu(width);
+            for piece in rdl::wires(&path, w, shape_of((sx, sy)), shape_of((tx, ty))) {
+                match piece {
+                    rdl::Wire::Straight(r) => {
+                        println!("RECT {} {} {} {}", r.0, r.1, r.2, r.3)
+                    }
+                    rdl::Wire::Diagonal(a, b, w) => {
+                        println!("DIAG {} {} {} {} {w}", a.0, a.1, b.0, b.1)
+                    }
+                }
+            }
         }
         return ExitCode::SUCCESS;
     }
