@@ -198,6 +198,56 @@ pub fn edges_clear(
     out
 }
 
+/// Somewhere the router may start or finish: a pin shape it has to touch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub terminal: String,
+    pub centre: Point,
+    pub shape: Rect,
+    /// Grid points from which this target can be reached, filled in by [`access_points`].
+    pub access: Vec<Point>,
+}
+
+/// **G9** — the greatest usable grid coordinate strictly below `at`, and the least strictly above.
+///
+/// ⚠️ Only coordinates that are **not** inside an obstruction take part.
+pub fn nearest_tracks(axis: &[i32], at: i32, usable: &dyn Fn(i32) -> bool) -> Vec<i32> {
+    let open: Vec<i32> = axis.iter().copied().filter(|&c| usable(c)).collect();
+    let mut out = Vec::new();
+    if let Some(&below) = open.iter().filter(|&&c| c < at).next_back() {
+        out.push(below);
+    }
+    if let Some(&above) = open.iter().find(|&&c| c > at) {
+        out.push(above);
+    }
+    out
+}
+
+/// **G10** — the grid points a target can be entered from.
+///
+/// Four candidates at most: the nearest usable track on each side, in each axis. A candidate is
+/// dropped when the straight run from the target's centre to it would cross an obstruction that
+/// belongs to something else.
+///
+/// ⚠️ An obstruction belonging to **this** terminal does not count. The target sits inside its own
+/// pin metal, so every access line starts inside it; treating that as a violation would remove
+/// every access point the terminal has and make the net unroutable.
+pub fn access_points(g: &Grid, target: &Target, obstructions: &[Rect], own: &[Rect]) -> Vec<Point> {
+    let foreign = |r: &Rect| !own.contains(r);
+    let clear = |p: Point| !obstructions.iter().any(|r| foreign(r) && hits(p, p, *r));
+    let mut out = Vec::new();
+    for x in nearest_tracks(&g.x, target.centre.0, &|x| clear((x, target.centre.1))) {
+        out.push((x, target.centre.1));
+    }
+    for y in nearest_tracks(&g.y, target.centre.1, &|y| clear((target.centre.0, y))) {
+        out.push((target.centre.0, y));
+    }
+    out.retain(|&p| !obstructions.iter().any(|r| foreign(r) && hits(target.centre, p, *r)));
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +310,68 @@ mod tests {
         assert!(with45 > plain, "diagonals were added");
         // Nine diagonals from the four even-even positions of a 4 x 4 grid, once each.
         assert_eq!(with45 - plain, 9, "half-density diagonal mesh");
+    }
+
+    #[test]
+    fn the_nearest_track_on_each_side_is_taken() {
+        let axis = [0, 10, 20, 30, 40];
+        assert_eq!(nearest_tracks(&axis, 25, &|_| true), vec![20, 30]);
+        // ⚠️ Strictly either side: a target sitting exactly on a track does not use it.
+        assert_eq!(nearest_tracks(&axis, 20, &|_| true), vec![10, 30]);
+        assert_eq!(nearest_tracks(&axis, -5, &|_| true), vec![0], "nothing below");
+        assert_eq!(nearest_tracks(&axis, 100, &|_| true), vec![40], "nothing above");
+    }
+
+    #[test]
+    fn a_blocked_track_is_passed_over_for_the_next_one() {
+        let axis = [0, 10, 20, 30, 40];
+        assert_eq!(nearest_tracks(&axis, 25, &|c| c != 20 && c != 30), vec![10, 40]);
+    }
+
+    #[test]
+    fn a_target_reaches_the_grid_on_four_sides() {
+        let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
+        let t = Target {
+            terminal: "u/PAD".into(),
+            centre: (150, 150),
+            shape: (140, 140, 160, 160),
+            access: vec![],
+        };
+        let mut pts = access_points(&g, &t, &[], &[]);
+        pts.sort_unstable();
+        assert_eq!(pts, vec![(100, 150), (150, 100), (150, 200), (200, 150)]);
+    }
+
+    #[test]
+    fn a_targets_own_metal_does_not_block_its_access() {
+        // ⚠️ The target sits inside its own pin, so every access line starts inside it. Counting
+        // that as a violation leaves the terminal with no way in at all.
+        let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
+        let own = (140, 140, 160, 160);
+        let t = Target {
+            terminal: "u/PAD".into(),
+            centre: (150, 150),
+            shape: own,
+            access: vec![],
+        };
+        assert_eq!(access_points(&g, &t, &[own], &[own]).len(), 4);
+        assert!(access_points(&g, &t, &[own], &[]).is_empty(), "not excused, none survive");
+    }
+
+    #[test]
+    fn an_obstruction_in_the_way_removes_that_access_point() {
+        let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
+        let t = Target {
+            terminal: "u/PAD".into(),
+            centre: (150, 150),
+            shape: (140, 140, 160, 160),
+            access: vec![],
+        };
+        // A wall just left of the centre blocks the westward access only.
+        let wall = [(120, 0, 130, 300)];
+        let pts = access_points(&g, &t, &wall, &[]);
+        assert!(!pts.contains(&(100, 150)), "west is blocked");
+        assert!(pts.contains(&(200, 150)), "east is not");
     }
 
     #[test]

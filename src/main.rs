@@ -774,6 +774,36 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
     db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
 }
 
+/// **G9** — the pin shapes the router has to reach, per net.
+///
+/// One target per pin rectangle on the routing layer, on every **placed** instance the net
+/// touches. ⚠️ Unplaced instances are skipped rather than routed to where they are not.
+fn rdl_targets(db: &Db, net: &str, layer: &str) -> Vec<rdl::Target> {
+    let mut out = Vec::new();
+    for iterm in db.net_get_i_terms(net) {
+        let Some((inst, term)) = iterm.rsplit_once('/') else { continue };
+        if !db.inst_is_placed(inst) {
+            continue;
+        }
+        let master = db.inst_get_master(inst);
+        let orient = Orient::parse(&db.inst_get_orient(inst)).unwrap_or(Orient::R0);
+        let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+        for (l, x0, y0, x1, y1) in db.mterm_pin_boxes(&master, term).unwrap_or_default() {
+            if db.layer_name_by_number(l) != layer {
+                continue;
+            }
+            let shape = pin_shape((x0, y0, x1, y1), orient, origin);
+            out.push(rdl::Target {
+                terminal: iterm.clone(),
+                centre: ((shape.0 + shape.2) / 2, (shape.1 + shape.3) / 2),
+                shape,
+                access: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
 /// **G8** — everything the RDL router must not run into, as bloated rectangles.
 ///
 /// Four sources in the reference; the two that placed instances contribute are the ones every
@@ -883,13 +913,54 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let obstructions = rdl_obstructions(&db, &layer, bloat);
     let clear = rdl::edges_clear(&g, allow45, &|a, b| rdl::blocked(a, b, &obstructions));
 
+    // Routing targets, per net, for every net named on the command line.
+    let mut nets: Vec<String> = Vec::new();
+    if let Some(pats) = opts.get("nets") {
+        let pats: Vec<String> = pats.split_whitespace().map(str::to_string).collect();
+        nets = matching(&db.net_names(), &pats)
+            .into_iter()
+            .cloned()
+            .collect();
+    }
+    let mut target_report = String::new();
+    let mut total_targets = 0usize;
+    for n in &nets {
+        let t = rdl_targets(&db, n, &layer);
+        let iterms: std::collections::BTreeSet<&String> =
+            t.iter().map(|x| &x.terminal).collect();
+        total_targets += t.len();
+        target_report.push_str(&format!("{n} has {} targets\n", iterms.len()));
+    }
+    if let Some(path) = opts.get("centre-report") {
+        let mut all = std::collections::BTreeSet::new();
+        for n in &nets {
+            for t in rdl_targets(&db, n, &layer) {
+                all.insert(t.centre);
+            }
+        }
+        let body: String =
+            all.iter().map(|(x, y)| format!("{x} {y}\n")).collect();
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    if let Some(path) = opts.get("target-report") {
+        if let Err(e) = std::fs::write(path, &target_report) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
     let report = format!(
         "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"rdl-grid\",\n  \"status\": \"ok\",\n  \
-         \"vertices\": {},\n  \"edges\": {},\n  \"obstructions\": {},\n  \"columns\": {},\n  \
-         \"rows\": {}\n}}",
+         \"vertices\": {},\n  \"edges\": {},\n  \"obstructions\": {},\n  \"nets\": {},\n  \
+         \"targets\": {},\n  \"columns\": {},\n  \"rows\": {}\n}}",
         g.vertices(),
         clear.len(),
         obstructions.len(),
+        nets.len(),
+        total_targets,
         g.x.len(),
         g.y.len(),
     );
