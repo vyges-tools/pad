@@ -123,6 +123,43 @@ pub fn edge_weight(p0: Point, p1: Point, scale: f32) -> i64 {
     (scale * distance(p0, p1) as f32) as i64 + bias
 }
 
+/// A rectangle, already bloated by the clearance the router must keep.
+pub type Rect = (i32, i32, i32, i32);
+
+/// **G6** — does a segment touch a rectangle?
+///
+/// ⚠️ **Closed**: a segment that only grazes a corner counts as blocked. The router is deciding
+/// whether a wire may run here, and a wire touching an obstruction is a short.
+pub fn hits(p0: Point, p1: Point, r: Rect) -> bool {
+    // Bounding-box rejection, inclusive on every side.
+    if p0.0.max(p1.0) < r.0 || p0.0.min(p1.0) > r.2 {
+        return false;
+    }
+    if p0.1.max(p1.1) < r.1 || p0.1.min(p1.1) > r.3 {
+        return false;
+    }
+    // For an axis-aligned segment the boxes overlapping is the whole answer.
+    if p0.0 == p1.0 || p0.1 == p1.1 {
+        return true;
+    }
+    // Otherwise the rectangle must not sit wholly to one side of the segment's line.
+    let cross = |x: i32, y: i32| {
+        (p1.0 - p0.0) as i64 * (y - p0.1) as i64 - (p1.1 - p0.1) as i64 * (x - p0.0) as i64
+    };
+    let s = [cross(r.0, r.1), cross(r.2, r.1), cross(r.0, r.3), cross(r.2, r.3)];
+    !(s.iter().all(|&v| v > 0) || s.iter().all(|&v| v < 0))
+}
+
+/// **G7** — is this segment blocked by anything?
+///
+/// ℹ️ Obstructions arrive as **rectangles**, including where the reference holds a polygon. That is
+/// exact for this question, not an approximation: a segment meets a polygon exactly when it meets
+/// one of the rectangles a decomposition of that polygon is made of, and touching counts either
+/// way. It is only the *shape* that is decomposed, never the region.
+pub fn blocked(p0: Point, p1: Point, obstructions: &[Rect]) -> bool {
+    obstructions.iter().any(|&r| hits(p0, p1, r))
+}
+
 /// Every edge in the grid, as point pairs, each counted once.
 ///
 /// ⚠️ Deduplicated by the **unordered** pair. Keeping only the pairs that run "forwards" through
@@ -130,14 +167,30 @@ pub fn edge_weight(p0: Point, p1: Point, scale: f32) -> i64 {
 /// `(2,0) - (1,1)` has no counterpart generated from `(1,1)`, and dropping it silently deletes
 /// a quarter of the diagonal mesh.
 pub fn edges(g: &Grid, allow45: bool) -> Vec<(Point, Point)> {
+    edges_clear(g, allow45, &|_, _| false)
+}
+
+/// Every edge the router may actually use.
+///
+/// ⚠️ Vertices are **not** filtered — a grid point inside an obstruction stays in the graph, it
+/// simply has no usable edges. Removing it too would renumber everything and change nothing.
+pub fn edges_clear(
+    g: &Grid,
+    allow45: bool,
+    obstructed: &dyn Fn(Point, Point) -> bool,
+) -> Vec<(Point, Point)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for i in 0..g.x.len() {
         for j in 0..g.y.len() {
             for (ni, nj) in neighbours(g, i, j, allow45) {
                 let key = if (i, j) < (ni, nj) { ((i, j), (ni, nj)) } else { ((ni, nj), (i, j)) };
-                if seen.insert(key) {
-                    out.push(((g.x[i], g.y[j]), (g.x[ni], g.y[nj])));
+                if !seen.insert(key) {
+                    continue;
+                }
+                let (a, b) = ((g.x[i], g.y[j]), (g.x[ni], g.y[nj]));
+                if !obstructed(a, b) {
+                    out.push((a, b));
                 }
             }
         }
@@ -207,6 +260,35 @@ mod tests {
         assert!(with45 > plain, "diagonals were added");
         // Nine diagonals from the four even-even positions of a 4 x 4 grid, once each.
         assert_eq!(with45 - plain, 9, "half-density diagonal mesh");
+    }
+
+    #[test]
+    fn a_segment_touching_an_obstruction_is_blocked() {
+        let r = (100, 100, 200, 200);
+        assert!(hits((0, 150), (150, 150), r), "runs into it");
+        assert!(hits((0, 150), (100, 150), r), "⚠️ touches the edge");
+        assert!(hits((0, 0), (100, 100), r), "⚠️ touches a corner");
+        assert!(!hits((0, 150), (99, 150), r), "stops one unit short");
+        assert!(!hits((0, 0), (99, 99), r));
+    }
+
+    #[test]
+    fn a_diagonal_passing_beside_a_rectangle_is_not_blocked() {
+        // ⚠️ Their bounding boxes overlap, so the box test alone would call this blocked.
+        let r = (100, 100, 200, 200);
+        assert!(!hits((0, 300), (300, 500), r), "passes above");
+        assert!(hits((0, 100), (300, 300), r), "passes through");
+    }
+
+    #[test]
+    fn obstructed_edges_are_dropped_and_vertices_are_kept() {
+        let coords: Vec<i32> = (0..4).map(|i| 10 + i * 20).collect();
+        let g = grid(&coords, &coords, 4, 4);
+        let all = edges(&g, false).len();
+        let blocker = [(25, 0, 35, 1000)];
+        let some = edges_clear(&g, false, &|a, b| blocked(a, b, &blocker)).len();
+        assert!(some < all, "a wall removes edges");
+        assert_eq!(g.vertices(), 16, "and removes no vertices");
     }
 
     #[test]

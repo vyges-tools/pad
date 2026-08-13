@@ -774,6 +774,72 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
     db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
 }
 
+/// **G8** — everything the RDL router must not run into, as bloated rectangles.
+///
+/// Four sources in the reference; the two that placed instances contribute are the ones every
+/// design has:
+///
+/// 1. each master's **obstructions on the routing layer, minus its own pin shapes** — the pins are
+///    what the router is trying to reach, so they are carved back out;
+/// 2. each instance's pin shapes, which block everything except the net they belong to.
+///
+/// ⚠️ Bloating happens **before** the subtraction, not after. Bloating the result instead would
+/// eat into the pin openings by the clearance and could close them entirely.
+fn rdl_obstructions(db: &Db, layer: &str, bloat: i32) -> Vec<(i32, i32, i32, i32)> {
+    use vyges_loom::poly90::{Poly90Set, Rect as P90Rect};
+    let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
+    let on_layer = |v: Vec<(i64, i32, i32, i32, i32)>| -> Vec<(i32, i32, i32, i32)> {
+        v.into_iter()
+            .filter(|(l, ..)| db.layer_name_by_number(*l) == layer)
+            .map(|(_, a, b, c, d)| (a, b, c, d))
+            .collect()
+    };
+
+    let mut cache: std::collections::HashMap<String, Vec<(i32, i32, i32, i32)>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+
+    for inst in db.inst_names() {
+        if !db.inst_is_placed(&inst) {
+            continue;
+        }
+        let master = db.inst_get_master(&inst);
+        let orient = Orient::parse(&db.inst_get_orient(&inst)).unwrap_or(Orient::R0);
+        let origin = (db.inst_get_origin_x(&inst), db.inst_get_origin_y(&inst));
+
+        let shape = cache.entry(master.clone()).or_insert_with(|| {
+            let add: Vec<P90Rect> = on_layer(db.master_obstruction_boxes(&master).unwrap_or_default())
+                .into_iter()
+                .map(|r| { let g = grow(r); P90Rect::new(g.0, g.1, g.2, g.3) })
+                .collect();
+            if add.is_empty() {
+                return Vec::new();
+            }
+            let sub: Vec<P90Rect> = on_layer(db.master_pin_boxes(&master).unwrap_or_default())
+                .into_iter()
+                .map(|r| { let g = grow(r); P90Rect::new(g.0, g.1, g.2, g.3) })
+                .collect();
+            let mut set = Poly90Set::from_rects(&add);
+            if !sub.is_empty() {
+                set = set.difference(&Poly90Set::from_rects(&sub));
+            }
+            set.rects().into_iter().map(|r| (r.x0, r.y0, r.x1, r.y1)).collect()
+        });
+        for r in shape.clone() {
+            // Already bloated, so it moves onto the die unchanged.
+            out.push(pin_shape(r, orient, origin));
+        }
+
+        // The instance's own pin metal.
+        for term in db.master_get_m_terms(&master) {
+            for r in on_layer(db.mterm_pin_boxes(&master, &term).unwrap_or_default()) {
+                out.push(grow(pin_shape(r, orient, origin)));
+            }
+        }
+    }
+    out
+}
+
 /// **G1-G5** — the RDL routing grid.
 ///
 /// ⚠️ Only the grid. The search, obstructions and rip-up are later stages, and asking for a route
@@ -808,11 +874,22 @@ fn rdl_route(args: &[String]) -> ExitCode {
         Err(e) => return unsupported_or_error(&e),
     };
     let allow45 = opts.get("allow45").is_some();
+
+    let layer = opts.get("layer").unwrap_or_default().to_string();
+    let width = opts.get("width").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let spacing = opts.get("spacing").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let to_dbu = |v: f64| (v * dbu as f64).round() as i32;
+    let bloat = to_dbu(width) / 2 + to_dbu(spacing);
+    let obstructions = rdl_obstructions(&db, &layer, bloat);
+    let clear = rdl::edges_clear(&g, allow45, &|a, b| rdl::blocked(a, b, &obstructions));
+
     let report = format!(
         "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"rdl-grid\",\n  \"status\": \"ok\",\n  \
-         \"vertices\": {},\n  \"edges\": {},\n  \"columns\": {},\n  \"rows\": {}\n}}",
+         \"vertices\": {},\n  \"edges\": {},\n  \"obstructions\": {},\n  \"columns\": {},\n  \
+         \"rows\": {}\n}}",
         g.vertices(),
-        rdl::edges(&g, allow45).len(),
+        clear.len(),
+        obstructions.len(),
         g.x.len(),
         g.y.len(),
     );
