@@ -314,7 +314,31 @@ impl Graph {
 ///
 /// ⚠️ The centre-to-snap edge is added **without an obstruction check**. It runs through the
 /// terminal's own pin metal by construction, and checking it would refuse every terminal.
-pub fn insert_access(graph: &mut Graph, g: &Grid, centre: Point, snaps: &[Point]) {
+/// Edges to put back when a temporary change is undone.
+#[derive(Debug, Clone, Default)]
+pub struct Undo {
+    pub restore: Vec<(usize, usize, i64)>,
+    pub cut: Vec<(usize, usize)>,
+}
+
+impl Graph {
+    /// Put the graph back as it was before the change `undo` records.
+    pub fn undo(&mut self, undo: &Undo) {
+        for &(a, b) in &undo.cut {
+            self.cut(a, b);
+        }
+        for &(a, b, w) in &undo.restore {
+            self.join(a, b, w);
+        }
+    }
+
+    fn weight_between(&self, a: usize, b: usize) -> Option<i64> {
+        self.adj[a].iter().find(|&&(v, _)| v == b).map(|&(_, w)| w)
+    }
+}
+
+pub fn insert_access(graph: &mut Graph, g: &Grid, centre: Point, snaps: &[Point]) -> Undo {
+    let mut undo = Undo::default();
     let c = graph.vertex(centre);
     for &snap in snaps {
         // The two grid points this snap sits between, on its own line.
@@ -335,15 +359,59 @@ pub fn insert_access(graph: &mut Graph, g: &Grid, centre: Point, snaps: &[Point]
             .filter_map(|p| graph.index.get(&p).copied())
             .collect();
         if let [a, b] = ends[..] {
+            if let Some(w) = graph.weight_between(a, b) {
+                undo.restore.push((a, b, w));
+            }
             graph.cut(a, b);
         }
         let sv = graph.vertex(snap);
-        graph.join(sv, c, edge_weight(snap, centre, 1.0));
+        let w = edge_weight(snap, centre, 1.0);
+        graph.join(sv, c, w);
+        undo.cut.push((sv, c));
         for &e in &ends {
             let w = edge_weight(snap, graph.points[e], 1.0);
             graph.join(sv, e, w);
+            undo.cut.push((sv, e));
         }
     }
+    undo
+}
+
+/// **L6** — take a routed path out of the graph, recording how to put it back.
+///
+/// Every edge touching a route vertex goes, and so does every edge crossing the route's corridor.
+/// ⚠️ Recorded rather than simply deleted: rip-up has to restore exactly these edges, and
+/// recomputing which ones they were after the graph has moved on gives a different set.
+pub fn commit_route(graph: &mut Graph, route: &[Point], width: i32, spacing: i32) -> Undo {
+    let mut undo = Undo::default();
+    let corridor = commit_corridor(route, width, spacing);
+    let mut drop: std::collections::BTreeSet<(usize, usize)> = Default::default();
+
+    for p in route {
+        if let Some(&v) = graph.index.get(p) {
+            for &(o, _) in &graph.adj[v] {
+                drop.insert(if v < o { (v, o) } else { (o, v) });
+            }
+        }
+    }
+    for (i, &p) in graph.points.iter().enumerate() {
+        if !corridor.iter().any(|&r| hits(p, p, r)) {
+            continue;
+        }
+        for &(o, _) in &graph.adj[i] {
+            let q = graph.points[o];
+            if corridor.iter().any(|&r| hits(p, q, r)) {
+                drop.insert(if i < o { (i, o) } else { (o, i) });
+            }
+        }
+    }
+    for (a, b) in drop {
+        if let Some(w) = graph.weight_between(a, b) {
+            undo.restore.push((a, b, w));
+            graph.cut(a, b);
+        }
+    }
+    undo
 }
 
 /// **G11** — the cheapest route between two points.
@@ -683,6 +751,125 @@ pub fn ripup_targets(failed: &Route, routes: &[Route], extent: i32) -> Vec<usize
 pub fn commit_corridor(route: &[Point], width: i32, spacing: i32) -> Vec<Rect> {
     let d = width / 2 + spacing + 1;
     route.iter().map(|&(x, y)| (x - d, y - d, x + d, y + d)).collect()
+}
+
+/// What one completed run produced.
+#[derive(Debug, Clone, Default)]
+pub struct Routed {
+    /// `(net, source terminal, destination terminal, path)` for every route that connected.
+    pub paths: Vec<(String, String, String, Vec<Point>)>,
+    pub attempts: usize,
+    pub iterations: i32,
+    pub failed: Vec<String>,
+}
+
+/// **L7** — run every route to completion, rearranging when one cannot get through.
+///
+/// The queue is drained in [`Route::precedes`] order. A route that connects is committed and its
+/// corridor removed from the graph; one that does not is put back with its next destination. When
+/// the queue empties, whatever failed raises its priority, displaces whatever crosses its probe,
+/// and everything goes round again.
+///
+/// ⚠️ Two guards stop it thrashing, and both are the reference's: it gives up after
+/// `max_iterations`, and a round that routed **nothing new** rips nothing up — repeating a round
+/// that achieved nothing cannot achieve anything the second time either.
+#[allow(clippy::too_many_arguments)]
+pub fn route_all(
+    graph: &mut Graph,
+    grid: &Grid,
+    routes: &mut [Route],
+    access: &std::collections::HashMap<String, (Point, Vec<Point>, String)>,
+    width: i32,
+    spacing: i32,
+    turn_penalty: f32,
+    max_iterations: i32,
+) -> Routed {
+    let mut out = Routed::default();
+    let mut committed: Vec<Option<Undo>> = vec![None; routes.len()];
+    let mut queue: Vec<usize> = (0..routes.len()).collect();
+    let mut last_done: std::collections::BTreeSet<String> = Default::default();
+
+    loop {
+        queue.sort_by(|&a, &b| routes[a].precedes(&routes[b]));
+        while let Some(i) = queue.first().copied() {
+            queue.remove(0);
+            routes[i].pending = false;
+            if !routes[i].has_next() {
+                continue;
+            }
+            let d = routes[i].dests[routes[i].next].clone();
+            routes[i].next += 1;
+
+            let (Some(src), Some(dst)) = (access.get(&routes[i].source), access.get(&d.terminal))
+            else {
+                continue;
+            };
+            out.attempts += 1;
+            let a = insert_access(graph, grid, src.0, &src.1);
+            let b = insert_access(graph, grid, dst.0, &dst.1);
+            let path = shortest_path(graph, src.0, dst.0, turn_penalty);
+            graph.undo(&b);
+            graph.undo(&a);
+
+            if path.is_empty() {
+                if routes[i].has_next() {
+                    queue.push(i);
+                }
+                continue;
+            }
+            committed[i] = Some(commit_route(graph, &path, width, spacing));
+            routes[i].routed = true;
+            routes[i].points = path.clone();
+            out.paths.push((src.2.clone(), routes[i].source.clone(), d.terminal.clone(), path));
+        }
+
+        out.iterations += 1;
+        if out.iterations > max_iterations {
+            break;
+        }
+        let done: std::collections::BTreeSet<String> =
+            routes.iter().filter(|r| r.routed).map(|r| r.source.clone()).collect();
+        if done == last_done {
+            break;
+        }
+        last_done = done;
+
+        let failed = failed_routes(routes);
+        if failed.is_empty() {
+            break;
+        }
+        // ⚠️ Choose everything to displace BEFORE displacing anything: ripping up as we go would
+        // let a later failure probe a graph the earlier ones have already changed, so which routes
+        // move would depend on the order the failures happen to be listed in.
+        let mut ripped: std::collections::BTreeSet<usize> = Default::default();
+        for &f in &failed {
+            for t in ripup_targets(&routes[f], routes, spacing + width) {
+                ripped.insert(t);
+            }
+        }
+        for &t in &ripped {
+            if let Some(u) = committed[t].take() {
+                graph.undo(&u);
+            }
+            routes[t].routed = false;
+            routes[t].points.clear();
+            routes[t].next = 0;
+            routes[t].pending = true;
+            out.paths.retain(|(_, s, _, _)| *s != routes[t].source);
+            queue.push(t);
+        }
+        for &f in &failed {
+            routes[f].priority += 1;
+            routes[f].next = 0;
+            routes[f].pending = true;
+            queue.push(f);
+        }
+        if queue.is_empty() {
+            break;
+        }
+    }
+    out.failed = routes.iter().filter(|r| !r.routed).map(|r| r.source.clone()).collect();
+    out
 }
 
 #[cfg(test)]

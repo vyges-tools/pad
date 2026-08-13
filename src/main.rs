@@ -1141,8 +1141,110 @@ fn rdl_route(args: &[String]) -> ExitCode {
     if opts.get("grid-only").is_some() {
         return ExitCode::SUCCESS;
     }
-    let _ = &mut db;
-    unsupported_or_error(&(UNSUPPORTED.to_string() + "RDL routing (the grid is built; the search is not)"))
+
+    // ── The run itself ───────────────────────────────────────────────────────────────────────
+    let turn = opts.get("turn-penalty").and_then(|v| v.parse().ok()).unwrap_or(2.0f32);
+    let max_iters = opts.get("max-iterations").and_then(|v| v.parse().ok()).unwrap_or(10);
+    let w = to_dbu(width);
+    let sp = to_dbu(spacing);
+
+    let mut access: std::collections::HashMap<String, (rdl::Point, Vec<rdl::Point>, String)> =
+        std::collections::HashMap::new();
+    let mut shape_of: std::collections::HashMap<String, (i32, i32, i32, i32)> =
+        std::collections::HashMap::new();
+    let mut routes: Vec<rdl::Route> = Vec::new();
+
+    for n in &nets {
+        let targets = rdl_targets(&db, n, &layer);
+        let mut dests: Vec<rdl::Dest> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for t in &targets {
+            if !seen.insert(t.terminal.clone()) {
+                continue;
+            }
+            let (inst, pin) = t.terminal.rsplit_once('/').unwrap_or(("", ""));
+            let (inst, pin) = (inst.to_string(), pin.to_string());
+            let bb = (
+                db.iterm_get_b_box_x_min(&inst, &pin),
+                db.iterm_get_b_box_y_min(&inst, &pin),
+                db.iterm_get_b_box_x_max(&inst, &pin),
+                db.iterm_get_b_box_y_max(&inst, &pin),
+            );
+            let own: Vec<(i32, i32, i32, i32)> = obstructions
+                .iter()
+                .copied()
+                .filter(|r| rdl::hits(t.centre, t.centre, *r))
+                .collect();
+            let snaps = rdl::access_points(&g, t, &obstructions, &own);
+            access.insert(t.terminal.clone(), (t.centre, snaps, n.clone()));
+            shape_of.insert(t.terminal.clone(), t.shape);
+            dests.push(rdl::Dest {
+                terminal: t.terminal.clone(),
+                instance: inst.clone(),
+                centre: ((bb.0 + bb.2) / 2, (bb.1 + bb.3) / 2),
+                cover: db.master_is_cover(&db.inst_get_master(&inst)),
+                id: db.iterm_id(&inst, &pin).unwrap_or(0) as u64,
+            });
+        }
+        for d in dests.clone().into_iter().filter(|d| d.cover) {
+            let ordered = rdl::order_dests(&d.instance, d.centre, &dests);
+            if ordered.is_empty() {
+                continue;
+            }
+            routes.push(rdl::Route {
+                source: d.terminal.clone(),
+                instance: d.instance.clone(),
+                centre: d.centre,
+                id: d.id,
+                dests: ordered,
+                next: 0,
+                priority: 0,
+                routed: false,
+                pending: true,
+                points: Vec::new(),
+            });
+        }
+    }
+
+    let mut graph = rdl::Graph::build(&g, &clear, 1.0);
+    let done =
+        rdl::route_all(&mut graph, &g, &mut routes, &access, w, sp, turn, max_iters);
+
+    if !opts.dry_run {
+        let applied = (|| -> Result<(), String> {
+            // The reference replaces its own previous result and leaves fixed wires alone.
+            for net in done.paths.iter().map(|(n, ..)| n.clone()).collect::<std::collections::BTreeSet<_>>() {
+                db.clear_routed_swires(&net).map_err(|e| format!("{net}: {e}"))?;
+            }
+            for (net, src, dst, path) in &done.paths {
+                let s = shape_of.get(src).copied().unwrap_or_default();
+                let t = shape_of.get(dst).copied().unwrap_or_default();
+                make_special(&mut db, net)?;
+                for piece in rdl::wires(path, w, s, t) {
+                    if let rdl::Wire::Straight(r) = piece {
+                        db.add_swire_box(net, &layer, r, opts.get("fixed").is_some())
+                            .map_err(|e| format!("cannot write a wire on {net}: {e}"))?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = applied {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let made: Vec<String> =
+        done.paths.iter().map(|(n, s, d, _)| format!("{n}: {s} -> {d}")).collect();
+    eprintln!(
+        "routes {} of {}, {} attempts, {} iterations",
+        done.paths.len(),
+        routes.len(),
+        done.attempts,
+        done.iterations
+    );
+    finish_report(&opts, &mut db, "rdl-route", &made, &done.failed)
 }
 
 /// **B1** — assign a net to a bump.
