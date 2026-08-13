@@ -922,6 +922,7 @@ pub fn route_all(
     spacing: i32,
     turn_penalty: f32,
     max_iterations: i32,
+    rebuild: Option<&[(Point, Point)]>,
 ) -> Routed {
     let mut out = Routed::default();
     let mut committed: Vec<Option<Undo>> = vec![None; routes.len()];
@@ -970,6 +971,18 @@ pub fn route_all(
                 continue;
             };
             out.attempts += 1;
+            // ⚠️ An experiment, off by default: rebuild the graph from the original edge list and
+            // re-apply every committed corridor, so a vertex's edges sit in build order rather
+            // than in whatever order removing and restoring them has left. If the two runs differ,
+            // the accumulated order is what decides the remaining equal-cost choices.
+            if let Some(base) = rebuild {
+                *graph = Graph::build(grid, base, 1.0);
+                let laid_paths: Vec<Vec<Point>> =
+                    routes.iter().filter(|r| r.routed).map(|r| r.points.clone()).collect();
+                for pts in &laid_paths {
+                    commit_route(graph, pts, width, spacing);
+                }
+            }
             // ⚠️ Filtered against what is already on the die, every time.
             let laid: Vec<&[Point]> =
                 routes.iter().filter(|r| r.routed).map(|r| r.points.as_slice()).collect();
@@ -984,17 +997,24 @@ pub fn route_all(
             let a = insert_access(graph, grid, src.0, &src_open);
             let b = insert_access(graph, grid, dst.0, &dst_open);
             let path = shortest_path(graph, src.0, dst.0, turn_penalty);
-            graph.undo(&b);
-            graph.undo(&a);
             out.log.push((src.0, dst.0, path.len()));
 
             if path.is_empty() {
+                graph.undo(&b);
+                graph.undo(&a);
                 if routes[i].has_next() {
                     queue.push(i);
                 }
                 continue;
             }
+            // ⚠️ The corridor is taken out **while the terminal access is still grafted on**, and
+            // only then is the access removed. The route's own access points are route vertices,
+            // so committing first removes the edges around them too; undoing the access first
+            // leaves those edges in place and the next route may run straight past a terminal
+            // another route is already using.
             committed[i] = Some(commit_route(graph, &path, width, spacing));
+            graph.undo(&b);
+            graph.undo(&a);
             routes[i].routed = true;
             routes[i].points = path.clone();
             out.paths.push((src.2.clone(), routes[i].source.clone(), d.terminal.clone(), path));

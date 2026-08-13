@@ -168,6 +168,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--fixed" => o.keys.push(("fixed".into(), "1".into())),
             "--grid-only" => o.keys.push(("grid-only".into(), "1".into())),
             "--wires" => o.keys.push(("wires".into(), "1".into())),
+            "--rebuild-each" => o.keys.push(("rebuild-each".into(), "1".into())),
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -1208,7 +1209,17 @@ fn rdl_route(args: &[String]) -> ExitCode {
 
     let mut graph = rdl::Graph::build(&g, &clear, 1.0);
     let done =
-        rdl::route_all(&mut graph, &g, &mut routes, &access, w, sp, turn, max_iters);
+        rdl::route_all(
+            &mut graph,
+            &g,
+            &mut routes,
+            &access,
+            w,
+            sp,
+            turn,
+            max_iters,
+            opts.get("rebuild-each").map(|_| clear.as_slice()),
+        );
 
     if !opts.dry_run {
         let applied = (|| -> Result<(), String> {
