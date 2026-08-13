@@ -1859,6 +1859,76 @@ fn bump_pads(db: &Db, track: &Track, pads: &[Pad]) -> Vec<BumpPad> {
         .collect()
 }
 
+/// **SP1-SP8** — place a row by spreading pads out from where their bumps want them.
+fn place_force_directed(
+    track: &Track,
+    pads: &[Pad],
+    aligned: &[BumpPad],
+    conflict: &mut dyn FnMut(&str, Rect, Orient) -> Option<vyges_pad::Refusal>,
+    settled: &mut dyn FnMut(&Placement),
+) -> Result<Vec<Placement>, Refused> {
+    use vyges_pad::spread::{forces, ideal_position, spread_pass, Anchor, DAMPER, MAX_ITERATIONS};
+    let horizontal = track.horizontal();
+    let row = (track.start(), track.end());
+    let along = |c: (i32, i32)| if horizontal { c.0 } else { c.1 };
+
+    // ── Ideal positions, and a crude start for pads that serve no bump ───────────────────────
+    let mut targets: Vec<i32> = Vec::with_capacity(pads.len());
+    for (i, a) in aligned.iter().enumerate() {
+        let centres: Vec<i32> = a.bumps.iter().map(|b| along(b.centre)).collect();
+        // ⚠️ The row bounds here are inset by half the pad, as in the reference: everything in
+        // this stage is a centre coordinate.
+        let inset = (row.0 + a.width / 2, row.1 - a.width / 2);
+        let t = ideal_position(&centres).unwrap_or_else(|| {
+            vyges_pad::spread::unconstrained_start(i, pads.len(), &targets, inset)
+        });
+        targets.push(t);
+    }
+
+    // ── Restore order along the row ──────────────────────────────────────────────────────────
+    let mut ordered = targets.clone();
+    let mut weights = vec![1.0f32; ordered.len()];
+    for _ in 0..ordered.len() {
+        if !vyges_pad::spread::pool_adjacent_violators(&mut ordered, &mut weights) {
+            break;
+        }
+    }
+
+    // ── Spread until nothing overlaps ────────────────────────────────────────────────────────
+    let site = track.site_width.max(1);
+    let mut anchors: Vec<Anchor> = ordered
+        .iter()
+        .zip(aligned)
+        .map(|(&pos, a)| Anchor::at(pos - a.width / 2, a.width))
+        .collect();
+    let snap = |p: i32| track.index_to_pos(track.snap_to_site(p));
+    for k in 0..MAX_ITERATIONS {
+        let (spring, repel) = forces(k);
+        if !spread_pass(&mut anchors, &ordered, row, spring, repel, DAMPER, site, &snap) {
+            break;
+        }
+    }
+
+    // ── Commit ───────────────────────────────────────────────────────────────────────────────
+    let mut out = Vec::new();
+    for (i, a) in anchors.iter().enumerate() {
+        // ⚠️ Placed with shifting DISALLOWED: the spreading stage is what resolves overlap, and a
+        // placer that also shifts here would hide a spread that had not converged.
+        let p = place_one(
+            track,
+            track.snap_to_site(a.min),
+            &pads[i],
+            Orient::R0,
+            false,
+            false,
+            conflict,
+        )?;
+        settled(&p);
+        out.push(p);
+    }
+    Ok(out)
+}
+
 /// **BA1-BA5** — place a row so its pads sit under the bumps they serve.
 fn place_bump_aligned(
     track: &Track,
@@ -1957,7 +2027,8 @@ fn place_pads(args: &[String]) -> ExitCode {
                 None
             }
             ("default" | "bump_aligned", true) => Some(i32::MIN), // marker: bump-aligned
-            ("placer", _) => return Err(UNSUPPORTED.to_string() + "the annealing placer"),
+            // The force-directed placer. ⚠️ Named `placer`, and not an annealer: no RNG.
+            ("placer", _) => Some(i32::MIN + 1),
             (other, _) => return Err(format!("`{other}` is not a placement mode")),
         };
 
@@ -2008,7 +2079,10 @@ fn place_pads(args: &[String]) -> ExitCode {
         });
     };
     // ⚠️ `i32::MIN` is the marker set above for bump-aligned mode, not a spacing.
-    let result = if max_spacing == Some(i32::MIN) {
+    let result = if max_spacing == Some(i32::MIN + 1) {
+        let aligned = bump_pads(&db, &track, &pads);
+        place_force_directed(&track, &pads, &aligned, &mut conflict, &mut settle)
+    } else if max_spacing == Some(i32::MIN) {
         let aligned = bump_pads(&db, &track, &pads);
         place_bump_aligned(&track, &pads, &aligned, &mut conflict, &mut settle)
     } else {

@@ -131,9 +131,189 @@ pub fn nearest_legal(
     }
 }
 
+/// Where a pad sits: its span and its centre, kept together because the loop needs both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub min: i32,
+    pub centre: i32,
+    pub max: i32,
+    pub width: i32,
+}
+
+impl Anchor {
+    pub fn at(pos: i32, width: i32) -> Anchor {
+        Anchor { min: pos, centre: pos + width / 2, max: pos + width, width }
+    }
+
+    pub fn set_location(&mut self, pos: i32) {
+        *self = Anchor::at(pos, self.width);
+    }
+
+    /// **SP6** — how far `other` reaches past this pad's start.
+    ///
+    /// ⚠️ **One-sided and directional.** It measures only `other.max - self.min`, so it is
+    /// meaningful when `other` is the pad *before* this one and meaningless the other way round.
+    /// The loop always calls it in that direction; a symmetric overlap would report a collision
+    /// between every pair of pads that merely sit near one another.
+    pub fn overlap(&self, other: &Anchor) -> i32 {
+        if other.max > self.min {
+            other.max - self.min
+        } else {
+            0
+        }
+    }
+}
+
+/// **SP7** — how far a pad moves this iteration.
+///
+/// The spring pulls it toward its ideal; an overlap with the pad before pushes it forward and one
+/// with the pad after pushes it back, each by the overlap **plus a whole site**, so a resolved
+/// collision leaves a gap rather than a touch.
+///
+/// ⚠️ The damped move is rounded **up** to a whole site, so any non-zero force moves at least one
+/// site. Rounding down would let a small force compute a sub-site move, round to nothing, and the
+/// loop would spin to the iteration limit with the row still overlapping.
+#[allow(clippy::too_many_arguments)]
+pub fn step_move(
+    spring_delta: i32,
+    spring: f32,
+    overlap_prev: i32,
+    overlap_next: i32,
+    repel: f32,
+    damper: f32,
+    site: i32,
+) -> i32 {
+    let mut force = spring_delta as f32 * spring;
+    if overlap_prev > 0 {
+        force += (overlap_prev + site) as f32 * repel;
+    }
+    if overlap_next > 0 {
+        force -= (overlap_next + site) as f32 * repel;
+    }
+    let magnitude = (force * damper).abs();
+    let sign = if force < 0.0 { -1 } else { 1 };
+    sign * (magnitude / site as f32).ceil() as i32 * site
+}
+
+/// **SP8** — one pass over the row.
+///
+/// Each pad moves in turn and **sees the pads before it already moved** — the pass is sequential,
+/// not simultaneous. A pad is clamped between its neighbours' centres, and between the row's ends
+/// for the first and last.
+///
+/// ⚠️ The row's ends are **inset by half the pad's own width**, because everything in this loop is
+/// in *centre* coordinates. Clamping a centre against the raw row edge lets the last pad hang half
+/// its width past the end of the row — which the placer then refuses to place, reporting a pad
+/// that does not fit in a row that has room for it.
+///
+/// Returns whether any overlap remained, which is what stops the outer loop.
+#[allow(clippy::too_many_arguments)]
+pub fn spread_pass(
+    anchors: &mut [Anchor],
+    targets: &[i32],
+    row: (i32, i32),
+    spring: f32,
+    repel: f32,
+    damper: f32,
+    site: i32,
+    snap: &dyn Fn(i32) -> i32,
+) -> bool {
+    let mut violations = false;
+    for i in 0..anchors.len() {
+        let curr = anchors[i];
+        let half = curr.width / 2;
+        let prev_pos = if i == 0 { row.0 + half } else { anchors[i - 1].centre };
+        let next_pos = if i + 1 == anchors.len() { row.1 - half } else { anchors[i + 1].centre };
+
+        let overlap_prev = if i == 0 { 0 } else { curr.overlap(&anchors[i - 1]) };
+        let overlap_next =
+            if i + 1 == anchors.len() { 0 } else { anchors[i + 1].overlap(&curr) };
+        if overlap_prev > 0 || overlap_next > 0 {
+            violations = true;
+        }
+
+        let move_by = step_move(
+            targets[i] - curr.centre,
+            spring,
+            overlap_prev,
+            overlap_next,
+            repel,
+            damper,
+            site,
+        );
+        let want = snap(curr.centre + move_by - half) + half;
+        anchors[i].set_location(want.clamp(prev_pos, next_pos) - half);
+    }
+    violations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn anchors(spec: &[(i32, i32)]) -> Vec<Anchor> {
+        spec.iter().map(|&(p, w)| Anchor::at(p, w)).collect()
+    }
+
+    #[test]
+    fn overlap_is_measured_one_way_only() {
+        // ⚠️ `a.overlap(b)` asks how far b reaches past a's start — meaningful only when b is the
+        // pad BEFORE a. Reading it symmetrically reports collisions between pads that merely
+        // sit near each other.
+        let a = Anchor::at(100, 50); // 100..150
+        let b = Anchor::at(120, 50); // 120..170
+        assert_eq!(a.overlap(&b), 70, "b reaches 70 past a's start");
+        assert_eq!(b.overlap(&a), 30, "and the reverse is a different number");
+        // A pad genuinely behind and clear of it gives zero.
+        let behind = Anchor::at(0, 50); // 0..50, ends before a starts
+        assert_eq!(a.overlap(&behind), 0, "clear behind means no push");
+        // ⚠️ And a pad AHEAD gives a number that means nothing — which is why the loop only ever
+        // asks in the one direction. This assertion exists to pin that hazard, not to bless it.
+        let ahead = Anchor::at(400, 50);
+        assert_eq!(a.overlap(&ahead), 350, "nonsense, and never asked for");
+    }
+
+    #[test]
+    fn any_non_zero_force_moves_at_least_one_site() {
+        // ⚠️ A tiny force still moves a whole site, because the damped move rounds UP. Rounding
+        // down would stall the loop with the row still overlapping.
+        assert_eq!(step_move(1, 0.1, 0, 0, 0.5, 0.2, 1000), 1000);
+        assert_eq!(step_move(0, 0.1, 0, 0, 0.5, 0.2, 1000), 0, "no force, no move");
+    }
+
+    #[test]
+    fn an_overlap_pushes_by_the_overlap_plus_a_whole_site() {
+        // The pad before overlaps by 500 with a 1000 site: the push is forward.
+        assert!(step_move(0, 0.0, 500, 0, 0.5, 0.2, 1000) > 0);
+        // The pad after overlaps: the push is backward.
+        assert!(step_move(0, 0.0, 0, 500, 0.5, 0.2, 1000) < 0);
+    }
+
+    #[test]
+    fn a_pass_separates_two_overlapping_pads() {
+        let mut a = anchors(&[(1000, 1000), (1500, 1000)]);
+        let targets = [1500, 2000];
+        let had = spread_pass(&mut a, &targets, (0, 10_000), 0.1, 0.5, 0.2, 100, &|p| p);
+        assert!(had, "the pass reports the overlap it found");
+        assert!(a[1].min >= a[0].min, "and the order is preserved");
+    }
+
+    #[test]
+    fn a_settled_row_reports_no_violation() {
+        let mut a = anchors(&[(0, 1000), (2000, 1000), (4000, 1000)]);
+        let targets = [500, 2500, 4500];
+        assert!(!spread_pass(&mut a, &targets, (0, 10_000), 0.0, 0.5, 0.2, 100, &|p| p));
+    }
+
+    #[test]
+    fn a_pad_is_clamped_between_its_neighbours() {
+        // ⚠️ The middle pad cannot pass either neighbour however hard the spring pulls.
+        let mut a = anchors(&[(0, 100), (1000, 100), (2000, 100)]);
+        let targets = [50, 900_000, 2050];
+        spread_pass(&mut a, &targets, (0, 10_000), 1.0, 0.5, 1.0, 10, &|p| p);
+        assert!(a[1].centre <= a[2].centre, "never past the pad ahead");
+        assert!(a[1].centre >= a[0].centre, "nor behind the one before");
+    }
 
     #[test]
     fn an_ideal_position_is_the_mean_of_the_bumps_served() {
