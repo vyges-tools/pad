@@ -19,6 +19,7 @@
 //! Nothing in this module reads a database; the binary does that and hands values in.
 
 pub mod abut;
+pub mod assign;
 pub mod bond;
 pub mod bump;
 pub mod clearance;
@@ -30,6 +31,7 @@ pub mod ring;
 
 pub use orient::Orient;
 pub use abut::{all_touching, connect_by_abutment, touches, touching_terms, Conflict, PadInst, Plan, Terminal};
+pub use assign::{assign, top_shape, Assignment, BumpTerm};
 pub use bond::{bond_shape, is_bond_master, matching, Bond};
 pub use fill::{fill_row, gaps, Fill, Filler, Unfilled, FILL_PREFIX};
 pub use bump::{bumps, is_bump_master, Array, DEFAULT_PREFIX};

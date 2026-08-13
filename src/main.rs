@@ -19,6 +19,7 @@ use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
 use vyges_pad::fill::{fill_row, Filler, Unfilled};
 use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, PadInst, Terminal};
 use vyges_pad::bond::{bond_shape, is_bond_master, matching, pin_shape, place as bond_place};
+use vyges_pad::assign::{assign, BumpTerm, Refused as AssignRefused};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
@@ -36,6 +37,8 @@ USAGE:
                               [--permit-overlaps 'M'] [options]
   vyges loom pad place-io-terminals <design.odb> --pins 'PATTERN...'
                                    [--allow-non-top-layer] [options]
+  vyges loom pad assign-io-bump <design.odb> --bump INST --net N
+                               [--terminal INST/PIN] [--dont-route] [options]
   vyges loom pad connect-by-abutment <design.odb> [options]
   vyges loom pad place-bondpad <design.odb> --bond M --insts 'PATTERN...'
                                [--offset 'X Y'] [--rotation R] [--prefix P] [options]
@@ -157,6 +160,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             // ⚠️ Flags must be listed here. Anything else beginning with `--` is read as taking a
             // value, so an unlisted flag silently swallows the argument after it.
             "--allow-non-top-layer" => o.keys.push(("allow-non-top-layer".into(), "1".into())),
+            "--dont-route" => o.keys.push(("dont-route".into(), "1".into())),
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -764,6 +768,117 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
     db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
 }
 
+/// **B1** — assign a net to a bump.
+fn assign_io_bump(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let prepared = (|| -> Result<(String, String, Vec<BumpTerm>, Rect, Option<String>), String> {
+        let bump = opts.need("bump")?.to_string();
+        let net = opts.need("net")?.to_string();
+        if db.net_get_sig_type(&net).is_empty() && db.net_get_i_term_count(&net) == 0 {
+            // A net that exists has a signal type; one that does not would be created silently.
+            return Err(format!("no net named `{net}` in this design"));
+        }
+        let master = db.inst_get_master(&bump);
+        if master.is_empty() {
+            return Err(format!("no instance named `{bump}` in this design"));
+        }
+        let class = db.master_get_type(&master).unwrap_or_default();
+        if !is_bump_master(&class) {
+            return Err(format!("{bump} is a `{class}` cell, not a bump"));
+        }
+
+        let terms = db
+            .master_get_m_terms(&master)
+            .into_iter()
+            .map(|term| {
+                let shapes = db
+                    .mterm_pin_boxes(&master, &term)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(l, x0, y0, x1, y1)| {
+                        let name = db.layer_name_by_number(l);
+                        let level = db.layer_get_routing_level(&name);
+                        (name, level, (x0, y0, x1, y1))
+                    })
+                    .collect();
+                let n = db.iterm_get_net(&bump, &term);
+                BumpTerm { name: term, net: (!n.is_empty()).then_some(n), shapes }
+            })
+            .collect();
+
+        let (mw, mh) = master_size(&db, &master)
+            .map_err(|e| format!("cannot measure master `{master}`: {e}"))?;
+        Ok((bump, net, terms, (0, 0, mw, mh), opts.get("terminal").map(str::to_string)))
+    })();
+
+    let (bump, net, terms, master_box, terminal) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // ⚠️ `-dont_route` and `-terminal` are mutually exclusive in the reference, and both only feed
+    // the RDL router's map. With no router here, `--dont-route` records intent and changes nothing.
+    if opts.get("dont-route").is_some() && terminal.is_some() {
+        eprintln!("vyges-pad: --dont-route and --terminal cannot be used together");
+        return ExitCode::from(2);
+    }
+
+    let term_state = terminal.as_ref().and_then(|t| {
+        t.rsplit_once('/').map(|(i, p)| {
+            let n = db.iterm_get_net(i, p);
+            (t.as_str(), (!n.is_empty()).then_some(n))
+        })
+    });
+    let plan = match assign(
+        &terms,
+        &net,
+        master_box,
+        term_state.as_ref().map(|(t, n)| (*t, n.as_deref())),
+    ) {
+        Ok(v) => v,
+        Err(AssignRefused::WrongNet { terminal, net: other }) => {
+            eprintln!("vyges-pad: {terminal} is connected to {other}, not to {net}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if !opts.dry_run {
+        let applied = (|| -> Result<(), String> {
+            for term in &plan.connect {
+                db.connect(&bump, term, &net)
+                    .map_err(|e| format!("cannot connect {bump}/{term} to {net}: {e}"))?;
+            }
+            if let Some(t) = &plan.terminal {
+                let (i, p) = t.rsplit_once('/').ok_or_else(|| format!("{t} is not inst/pin"))?;
+                db.connect(i, p, &net).map_err(|e| format!("cannot connect {t} to {net}: {e}"))?;
+            }
+            if let Some((layer, rect)) = &plan.bterm {
+                let orient = Orient::parse(&db.inst_get_orient(&bump)).unwrap_or(Orient::R0);
+                let origin = (db.inst_get_origin_x(&bump), db.inst_get_origin_y(&bump));
+                make_bterm(&mut db, &net, layer, pin_shape(*rect, orient, origin))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = applied {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let mut made: Vec<String> = plan.connect.iter().map(|t| format!("{bump}/{t} -> {net}")).collect();
+    if let Some(t) = &plan.terminal {
+        made.push(format!("{t} -> {net}"));
+    }
+    finish_report(&opts, &mut db, "bump-assignment", &made, &[])
+}
+
 /// **T1** — give each named pad terminal a block terminal on the die's top routing layer.
 fn place_io_terminals(args: &[String]) -> ExitCode {
     let (opts, mut db) = match open(args) {
@@ -1183,6 +1298,17 @@ fn connect_ring(args: &[String]) -> ExitCode {
     finish_report(&opts, &mut db, "abutment", &touched, &plan.destroy)
 }
 
+/// Marks an error as "this engine does not implement that", which exits 3 rather than 2.
+///
+/// A caller can then tell a feature that is missing from a design that is wrong — a distinction
+/// worth an exit code, because the two want opposite responses.
+const UNSUPPORTED: &str = "not implemented: ";
+
+fn unsupported_or_error(message: &str) -> ExitCode {
+    eprintln!("vyges-pad: {message}");
+    ExitCode::from(if message.starts_with(UNSUPPORTED) { 3 } else { 2 })
+}
+
 /// **P5** — spread a list of pads along one side of the ring.
 fn place_pads(args: &[String]) -> ExitCode {
     let (opts, mut db) = match open(args) {
@@ -1231,9 +1357,9 @@ fn place_pads(args: &[String]) -> ExitCode {
                 None
             }
             ("default" | "bump_aligned", true) => {
-                return Err("bump-aligned placement is not implemented".into())
+                return Err(UNSUPPORTED.to_string() + "bump-aligned placement")
             }
-            ("placer", _) => return Err("the annealing placer is not implemented".into()),
+            ("placer", _) => return Err(UNSUPPORTED.to_string() + "the annealing placer"),
             (other, _) => return Err(format!("`{other}` is not a placement mode")),
         };
 
@@ -1248,10 +1374,7 @@ fn place_pads(args: &[String]) -> ExitCode {
 
     let (track, pads, max_spacing) = match prepared {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("vyges-pad: {e}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return unsupported_or_error(&e),
     };
 
     // ⚠️ Everything already in the way, once -- **and each pad joins the list as it lands**. A pad
@@ -1316,8 +1439,13 @@ fn place_pads(args: &[String]) -> ExitCode {
 /// ⚠️ Supply nets do not count: a pad and a bump on `VDD` are expected to meet through the power
 /// grid, and treating that as an alignment request would align the whole ring to the power bumps.
 fn connects_to_a_bump(db: &Db, inst: &str) -> bool {
-    for pin in db.inst_get_i_terms(inst) {
-        let net = db.iterm_get_net(inst, &pin);
+    for iterm in db.inst_get_i_terms(inst) {
+        // ⚠️ An iterm reads `<instance>/<terminal>`, and the accessors below want the TERMINAL on
+        // its own. Passing the whole string as the terminal matches nothing, returns no net, and
+        // reports "no pad connects to a bump" for every design — a check that can only fail one
+        // way, whose failure looks exactly like a correct negative answer.
+        let Some((_, pin)) = iterm.rsplit_once('/') else { continue };
+        let net = db.iterm_get_net(inst, pin);
         if net.is_empty() || matches!(db.net_get_sig_type(&net).as_str(), "POWER" | "GROUND") {
             continue;
         }
@@ -1658,6 +1786,7 @@ fn main() -> ExitCode {
         Some("place-bondpad") => place_bondpad(&args[1..]),
         Some("place-io-fill") => place_io_fill(&args[1..]),
         Some("place-io-terminals") => place_io_terminals(&args[1..]),
+        Some("assign-io-bump") => assign_io_bump(&args[1..]),
         Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),
