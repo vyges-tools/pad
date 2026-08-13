@@ -29,6 +29,7 @@ pub mod pads;
 pub mod place;
 pub mod rdl;
 pub mod ring;
+pub mod spread;
 
 pub use orient::Orient;
 pub use abut::{all_touching, connect_by_abutment, touches, touching_terms, Conflict, PadInst, Plan, Terminal};
@@ -43,4 +44,5 @@ pub use place::{
     snap_to_site, Edge, Placement, RowGeom,
 };
 pub use rdl::{edges as rdl_edges, grid as rdl_grid, thin, Grid};
+pub use spread::{forces, ideal_position, nearest_legal, pool_adjacent_violators, unconstrained_start};
 pub use ring::{make_rows, row_name, Offsets, Rotations, Row, RowDir, Site};
