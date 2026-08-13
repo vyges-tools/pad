@@ -10,14 +10,19 @@
 
 use std::process::ExitCode;
 use vyges_opendb::Db;
-use vyges_pad::{make_rows, Offsets, Orient, Row, RowDir, Rotations, Site};
+use vyges_pad::{corner_placement, corner_row_names, make_rows, mirror_base, oriented_size,
+    overlaps, place_in_row, snap_to_site, Offsets, Orient, Placement, Row, RowDir, RowGeom,
+    Rotations, Site};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
 
 USAGE:
-  vyges loom pad make-io-sites <design.odb> --horizontal-site S --vertical-site S
-                               --corner-site S --offset D [options]
+  vyges loom pad make-io-sites  <design.odb> --horizontal-site S --vertical-site S
+                                --corner-site S --offset D [options]
+  vyges loom pad place-corners  <design.odb> --master M [--ring-index N] [options]
+  vyges loom pad place-pad      <design.odb> --row R --location D [--master M]
+                                [--mirror] --inst NAME [options]
   vyges loom pad --describe
   vyges loom pad --help
 
@@ -30,6 +35,11 @@ OPTIONS:
   --rotation-vertical R    rotation applied to the bottom/top rows (default R0)
   --rotation-corner R      rotation applied to the corners (default R0)
   --ring-index N         suffix the row names with _N, for a design with several rings
+  --master M             the cell to place
+  --row R                the IO row to place into (place-pad)
+  --location D           where along that row, in MICRONS (place-pad)
+  --inst NAME            the instance to place or create (place-pad)
+  --mirror               mirror the pad about the row
   --out-odb FILE         write the database here (default: IN PLACE, over the input)
   --out-def FILE         also write the result as DEF (for diffing against a golden)
   --dry-run              report the ring, write nothing
@@ -95,6 +105,7 @@ struct Opts {
     odb: String,
     keys: Vec<(String, String)>,
     dry_run: bool,
+    mirror: bool,
 }
 
 impl Opts {
@@ -115,6 +126,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         match a {
             "--json" => {}
             "--dry-run" => o.dry_run = true,
+            "--mirror" => o.mirror = true,
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -155,6 +167,328 @@ fn def_dir(dir: RowDir) -> &'static str {
         RowDir::Horizontal => "HORIZONTAL",
         RowDir::Vertical => "VERTICAL",
     }
+}
+
+/// Read a row back from the database.
+///
+/// ℹ️ By NAME, which is safe here and is not always: `tap`'s cut rows can share a name, and a
+/// by-name accessor then silently returns the first. The ring's row names are unique by
+/// construction — one per edge, per corner, per ring index.
+fn read_row(db: &Db, name: &str) -> Option<RowGeom> {
+    let spacing = db.row_get_spacing(name);
+    let sites = db.row_get_site_count(name);
+    if spacing <= 0 || sites <= 0 {
+        return None;
+    }
+    Some(RowGeom {
+        name: name.to_string(),
+        bbox: (
+            db.row_get_b_box_x_min(name),
+            db.row_get_b_box_y_min(name),
+            db.row_get_b_box_x_max(name),
+            db.row_get_b_box_y_max(name),
+        ),
+        orient: Orient::parse(&db.row_get_orient(name)).unwrap_or(Orient::R0),
+        origin: (db.row_get_origin_x(name), db.row_get_origin_y(name)),
+        spacing,
+        site_count: sites,
+    })
+}
+
+/// Everything a cell must not land on.
+///
+/// Two filters, and both matter — without them a correct placement is refused:
+///
+/// - ⚠️ **Only FIXED instances block.** A merely `PLACED` cell is not yet committed and the
+///   reference walks straight past it. Testing "is it placed" instead rejects positions that are
+///   perfectly legal.
+/// - ⚠️ **A COVER master does not block.** Bumps sit *over* the die, not in the ring, so a bump
+///   above a corner is not in its way. The reference routes them into a separate set used for RDL
+///   routing instead.
+///
+/// ℹ️ Routing **obstructions** are deliberately absent: the reference puts those in that same
+/// RDL set, not in the placement check. Placement blockages are what would belong here, and no
+/// case among the supported ones uses one.
+///
+/// `skip` is the cell being placed — an instance that already exists must not block itself, or
+/// re-running a placement would refuse the position it already holds.
+fn blockers(db: &Db, skip: &str) -> Vec<(i32, i32, i32, i32)> {
+    let mut out: Vec<(i32, i32, i32, i32)> = Vec::new();
+    for name in db.inst_names() {
+        if name == skip {
+            continue;
+        }
+        if !matches!(db.inst_get_placement_status(&name).as_str(), "FIRM" | "LOCKED" | "COVER") {
+            continue;
+        }
+        // ⚠️ **Prefix, not equality.** odb reports a master's class as the LEF spells it, and
+        // `CLASS COVER BUMP` comes back as `"COVER BUMP"`. An equality test against `"COVER"`
+        // matches nothing, blocks every bump, and fails silently — the same trap `tap` hit with
+        // LEF58 endcap types.
+        if db.master_get_type(&db.inst_get_master(&name)).unwrap_or_default().starts_with("COVER") {
+            continue;
+        }
+        if let Ok(b) = db.inst_bbox(&name) {
+            if let [x0, y0, x1, y1] = b[..] {
+                out.push((x0, y0, x1, y1));
+            }
+        }
+    }
+    out
+}
+
+/// The size of a master, as the placer needs it.
+fn master_size(db: &Db, master: &str) -> Result<(i32, i32), String> {
+    let (w, h) = (db.master_get_width(master) as i32, db.master_get_height(master) as i32);
+    if w <= 0 || h <= 0 {
+        return Err(format!("no master named `{master}` in this design"));
+    }
+    Ok((w, h))
+}
+
+/// Write the instance out, creating it only if the design does not already have it.
+fn commit(db: &mut Db, p: &Placement, create: bool) -> Result<(), String> {
+    if create {
+        db.create_inst(&p.master, &p.name).map_err(|e| format!("cannot create {}: {e}", p.name))?;
+    }
+    db.inst_set_orient(&p.name, &format!("{:?}", p.orient))
+        .map_err(|e| format!("cannot orient {}: {e}", p.name))?;
+    db.inst_set_location(&p.name, p.x, p.y)
+        .map_err(|e| format!("cannot place {}: {e}", p.name))?;
+    db.inst_set_placement_status(&p.name, "FIRM")
+        .map_err(|e| format!("cannot fix {}: {e}", p.name))?;
+    Ok(())
+}
+
+/// **C5, C6** — a cell in each of the four corner rows.
+///
+/// ⚠️ A corner that would land on something already there is **skipped**, not moved: the reference
+/// drops it and warns. One reference case places only three corners for exactly this reason, so
+/// placing all four unconditionally does not merely differ, it fails.
+fn place_corners(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let master = match opts.need("master").map(str::to_string) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let ring_index: i32 = match opts.get("ring-index") {
+        None => -1,
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("vyges-pad: --ring-index wants a whole number");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let size = match master_size(&db, &master) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut placed = Vec::new();
+    let mut skipped = Vec::new();
+    for row_name in corner_row_names(ring_index) {
+        let Some(row) = read_row(&db, &row_name) else {
+            eprintln!("vyges-pad: no row `{row_name}` to place a corner in");
+            return ExitCode::from(2);
+        };
+        let p = corner_placement(&row, &master);
+        let oriented = oriented_size(size.0, size.1, p.orient);
+        if overlaps((p.x, p.y), oriented, &blockers(&db, &p.name)) {
+            skipped.push(p.name.clone());
+            continue;
+        }
+        if !opts.dry_run {
+            if let Err(e) = commit(&mut db, &p, true) {
+                eprintln!("vyges-pad: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        placed.push(p);
+    }
+    finish(&opts, &mut db, "corners", &placed, &skipped)
+}
+
+/// **C1–C4** — one pad at a location along a row.
+fn place_pad(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let dbu = db.dbu_per_micron();
+
+    let built = (|| -> Result<(Placement, (i32, i32), bool), String> {
+        let inst = opts.need("inst")?.to_string();
+        let row_name = opts.need("row")?.to_string();
+        let location_um: f64 =
+            opts.need("location")?.parse().map_err(|_| "--location wants microns".to_string())?;
+        let location = (location_um * dbu as f64).round() as i32;
+
+        let existing = db.inst_names().iter().any(|n| n == &inst);
+        let master = match opts.get("master") {
+            Some(m) => m.to_string(),
+            None if existing => db.inst_get_master(&inst),
+            None => return Err(format!("cannot create {inst} without --master")),
+        };
+        // The reference refuses a master that contradicts the instance already in the design,
+        // rather than silently re-mastering it.
+        if existing {
+            let have = db.inst_get_master(&inst);
+            if !have.is_empty() && have != master {
+                return Err(format!("master mismatch for {inst}: it is {have}, not {master}"));
+            }
+        }
+
+        let row = read_row(&db, &row_name).ok_or(format!("no row named `{row_name}`"))?;
+        let edge = row.edge().ok_or(format!("`{row_name}` is not an IO row"))?;
+        let size = master_size(&db, &master)?;
+
+        let base = if opts.mirror {
+            let site = db.row_get_site(&row_name);
+            mirror_base(edge, db.site_get_width(&site), db.site_get_height(&site))
+        } else {
+            Orient::R0
+        };
+        let index = snap_to_site(location, &row, edge);
+        let (x, y, orient) = place_in_row(index, &row, edge, size.0, size.1, base);
+        Ok((Placement { name: inst, master, x, y, orient }, size, !existing))
+    })();
+
+    let (p, size, create) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let _ = size;
+    if !opts.dry_run {
+        if let Err(e) = commit(&mut db, &p, create) {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    finish(&opts, &mut db, "pad", &[p], &[])
+}
+
+/// Parse, open the database, and check it has a scale. Shared by every verb.
+fn open(args: &[String]) -> Result<(Opts, Db), ExitCode> {
+    let opts = match parse_opts(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}\n\n{USAGE}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    let db = match Db::open(&opts.odb) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("vyges-pad: cannot read {}: {e}", opts.odb);
+            return Err(ExitCode::from(2));
+        }
+    };
+    if db.dbu_per_micron() <= 0 {
+        eprintln!("vyges-pad: no DBU scale");
+        return Err(ExitCode::from(2));
+    }
+    Ok((opts, db))
+}
+
+/// Write the database and the report, and pick the exit status.
+fn finish(
+    opts: &Opts,
+    db: &mut Db,
+    what: &str,
+    placed: &[Placement],
+    skipped: &[String],
+) -> ExitCode {
+    if !opts.dry_run {
+        let out_odb = opts.get("out-odb").unwrap_or(&opts.odb).to_string();
+        if let Err(e) = db.write(&out_odb) {
+            eprintln!("vyges-pad: cannot write {out_odb}: {e}");
+            return ExitCode::from(2);
+        }
+        if let Some(path) = opts.get("out-def") {
+            if let Err(e) = db.write_def(path) {
+                eprintln!("vyges-pad: cannot write {path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    emit_placement_events(what, placed, skipped);
+    let report = placement_json(what, placed, skipped);
+    match opts.get("o") {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, format!("{report}\n")) {
+                eprintln!("vyges-pad: cannot write {path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => println!("{report}"),
+    }
+    // A skipped corner is the reference's own behaviour, not a failure of this run.
+    if placed.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn placement_json(what: &str, placed: &[Placement], skipped: &[String]) -> String {
+    let list = placed
+        .iter()
+        .map(|p| {
+            format!(
+                "    {{\"inst\": \"{}\", \"master\": \"{}\", \"x\": {}, \"y\": {}, \
+                 \"orient\": \"{:?}\"}}",
+                p.name, p.master, p.x, p.y, p.orient
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let missed =
+        skipped.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+    format!(
+        "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"{what}\",\n  \"status\": \"{}\",\n  \
+         \"placed\": {},\n  \"skipped\": [{missed}],\n  \"placements\": [\n{list}\n  ]\n}}",
+        if placed.is_empty() { "refused" } else { "ok" },
+        placed.len(),
+    )
+}
+
+fn emit_placement_events(what: &str, placed: &[Placement], skipped: &[String]) {
+    use vyges_events::{Event, Severity};
+    for s in skipped {
+        // Upstream warns and moves on. Saying so is the difference between "there is no corner
+        // there" and "nobody looked".
+        vyges_events::emit(
+            &Event::new(
+                "vyges-pad",
+                Severity::Warn,
+                format!("skipping {s}: it would overlap something already placed"),
+            )
+            .with_code("PAD-SKIP-OVERLAP")
+            .with_objects(vec![format!("inst:{s}")]),
+        );
+    }
+    vyges_events::emit(
+        &Event::new(
+            "vyges-pad",
+            Severity::Info,
+            format!("{what}: placed {}, skipped {}", placed.len(), skipped.len()),
+        )
+        .with_code("PAD-PLACED"),
+    );
 }
 
 fn make_io_sites(args: &[String]) -> ExitCode {
@@ -348,6 +682,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("make-io-sites") => make_io_sites(&args[1..]),
+        Some("place-corners") => place_corners(&args[1..]),
+        Some("place-pad") => place_pad(&args[1..]),
         Some(other) => {
             eprintln!("vyges-pad: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)
