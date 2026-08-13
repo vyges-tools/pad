@@ -37,7 +37,7 @@ pub use bond::{bond_shape, is_bond_master, matching, Bond};
 pub use fill::{fill_row, gaps, Fill, Filler, Unfilled, FILL_PREFIX};
 pub use bump::{bumps, is_bump_master, Array, DEFAULT_PREFIX};
 pub use clearance::{Reason, intersects, outline_of, refuse, transform, Blocker, Refusal, Shape};
-pub use pads::{fits, pad_width, place_one, place_uniform, target_spacing, Pad, Refused, Track};
+pub use pads::{alignment_group, group_positions, keep_flip, pad_bump_distance, travel, Bump, BumpPad, fits, pad_width, place_one, place_uniform, target_spacing, Pad, Refused, Track};
 pub use place::{
     corner_placement, corner_row_names, mirror_base, oriented_size, overlaps, place_in_row,
     snap_to_site, Edge, Placement, RowGeom,

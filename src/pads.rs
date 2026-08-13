@@ -347,3 +347,212 @@ mod tests {
         assert_eq!(pad_width(&h, (100, 60)), 100, "horizontal row consumes the width");
     }
 }
+
+
+// ── Bump-aligned placement ───────────────────────────────────────────────────────────────────
+
+/// A bump a pad connects to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bump {
+    pub terminal: String,
+    /// Centre of the bump terminal's bounding box.
+    pub centre: (i32, i32),
+    pub id: u64,
+}
+
+/// A pad awaiting bump-aligned placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BumpPad {
+    pub name: String,
+    pub id: u64,
+    /// Size along the row.
+    pub width: i32,
+    /// Every bump this pad shares a non-supply net with.
+    pub bumps: Vec<Bump>,
+}
+
+/// **BA1** — how far a pad sitting at `at` would be from a bump.
+///
+/// Measured from the pad's **centre** — `at + width / 2` — across to the bump, with the other axis
+/// pinned to the row's centre line. ⚠️ Squared, and squared is enough: it is only ever compared.
+pub fn pad_bump_distance(
+    at: i32,
+    width: i32,
+    bump: (i32, i32),
+    row_centre: (i32, i32),
+    horizontal: bool,
+) -> i64 {
+    let p = if horizontal {
+        (at + width / 2, row_centre.1)
+    } else {
+        (row_centre.0, at + width / 2)
+    };
+    let (dx, dy) = ((p.0 - bump.0) as i64, (p.1 - bump.1) as i64);
+    dx * dx + dy * dy
+}
+
+/// **BA2** — the run of pads that share a bump column.
+///
+/// Walking forward from `start`: each pad takes its **nearest** bump to the current offset, and the
+/// run continues only while that bump lies in the same column (or row) as the first pad's.
+///
+/// ⚠️ A pad with no bump at all **ends the run** rather than being skipped. The run is a contiguous
+/// block that will be centred on one bump column, and a pad belonging to no column cannot be in it.
+pub fn alignment_group(
+    pads: &[BumpPad],
+    start: usize,
+    offset: i32,
+    row_centre: (i32, i32),
+    horizontal: bool,
+) -> Vec<(usize, Bump)> {
+    let along = |c: (i32, i32)| if horizontal { c.0 } else { c.1 };
+    let mut out: Vec<(usize, Bump)> = Vec::new();
+    for (k, pad) in pads.iter().enumerate().skip(start) {
+        if pad.bumps.is_empty() {
+            break;
+        }
+        let best = pad
+            .bumps
+            .iter()
+            .min_by_key(|b| {
+                (pad_bump_distance(offset, pad.width, b.centre, row_centre, horizontal), b.id)
+            })
+            .cloned()
+            .expect("checked non-empty");
+        if let Some((_, first)) = out.first() {
+            if along(first.centre) != along(best.centre) {
+                break;
+            }
+        }
+        out.push((k, best));
+    }
+    out
+}
+
+/// **BA3** — where each pad of a group goes, before the travel budget is applied.
+///
+/// The group is centred on its bump column: it starts half its own width before the column and
+/// each pad follows the one before.
+///
+/// ⚠️ Positions are handed out in **instance id order**, not row order. The reference stores the
+/// group in a map keyed by instance and walks it, so a group whose pads were listed in another
+/// order comes out laid differently — a property of the reference, not of the geometry.
+pub fn group_positions(
+    pads: &[BumpPad],
+    group: &[(usize, Bump)],
+    horizontal: bool,
+) -> Vec<(usize, i32)> {
+    let along = |c: (i32, i32)| if horizontal { c.0 } else { c.1 };
+    let Some((_, first)) = group.first() else { return Vec::new() };
+    let total: i32 = group.iter().map(|&(k, _)| pads[k].width).sum();
+    let mut by_id: Vec<usize> = group.iter().map(|&(k, _)| k).collect();
+    by_id.sort_by_key(|&k| pads[k].id);
+    let mut at = along(first.centre) - total / 2;
+    by_id
+        .into_iter()
+        .map(|k| {
+            let here = (k, at);
+            at += pads[k].width;
+            here
+        })
+        .collect()
+}
+
+/// **BA4** — how far along the row a pad may actually go.
+///
+/// A pad never moves **backwards**, and the row may only move forward by the slack it has. Each
+/// pad's move spends from that budget.
+///
+/// ⚠️ Returns the position **and** the budget left. Not spending it lets every pad take the full
+/// slack and the row runs off its own end.
+pub fn travel(offset: i32, want: i32, budget: i32) -> (i32, i32) {
+    let take = budget.min((want - offset).max(0));
+    (offset + take, budget - take)
+}
+
+/// **BA5** — is flipping this pad worth it?
+///
+/// ⚠️ Only when the pad has **more than one** bump connection: with one there is nothing to trade
+/// off. The flip is kept unless it makes the total longer, so an exact tie **keeps** it.
+pub fn keep_flip(straight: i64, flipped: i64, connections: usize) -> bool {
+    connections > 1 && flipped <= straight
+}
+
+#[cfg(test)]
+mod bump_aligned_tests {
+    use super::*;
+
+    fn bump(name: &str, c: (i32, i32), id: u64) -> Bump {
+        Bump { terminal: name.into(), centre: c, id }
+    }
+
+    fn pad(name: &str, id: u64, width: i32, bumps: Vec<Bump>) -> BumpPad {
+        BumpPad { name: name.into(), id, width, bumps }
+    }
+
+    #[test]
+    fn a_pad_takes_its_nearest_bump() {
+        let pads =
+            vec![pad("a", 1, 100, vec![bump("far", (900, 500), 1), bump("near", (100, 500), 2)])];
+        assert_eq!(alignment_group(&pads, 0, 0, (0, 0), true)[0].1.terminal, "near");
+    }
+
+    #[test]
+    fn a_run_stops_at_a_different_bump_column() {
+        let pads = vec![
+            pad("a", 1, 100, vec![bump("x", (100, 500), 1)]),
+            pad("b", 2, 100, vec![bump("x2", (100, 900), 2)]),
+            pad("c", 3, 100, vec![bump("y", (700, 500), 3)]),
+        ];
+        assert_eq!(alignment_group(&pads, 0, 0, (0, 0), true).len(), 2);
+    }
+
+    #[test]
+    fn a_pad_with_no_bump_ends_the_run() {
+        // ⚠️ Ends it, rather than being skipped over.
+        let pads = vec![
+            pad("a", 1, 100, vec![bump("x", (100, 500), 1)]),
+            pad("b", 2, 100, vec![]),
+            pad("c", 3, 100, vec![bump("x", (100, 500), 2)]),
+        ];
+        assert_eq!(alignment_group(&pads, 0, 0, (0, 0), true).len(), 1);
+        assert!(alignment_group(&pads, 1, 0, (0, 0), true).is_empty(), "and cannot start one");
+    }
+
+    #[test]
+    fn a_group_is_centred_on_its_bump_column() {
+        let pads = vec![
+            pad("a", 1, 100, vec![bump("x", (1000, 500), 1)]),
+            pad("b", 2, 100, vec![bump("x", (1000, 500), 2)]),
+        ];
+        let g = alignment_group(&pads, 0, 0, (0, 0), true);
+        // The group spans 900..1100, centred on the column; each pad follows the one before.
+        assert_eq!(group_positions(&pads, &g, true), vec![(0, 900), (1, 1000)]);
+    }
+
+    #[test]
+    fn positions_within_a_group_follow_instance_id_order() {
+        // ⚠️ Not row order. The reference walks a map keyed by instance.
+        let pads = vec![
+            pad("a", 9, 100, vec![bump("x", (1000, 500), 1)]),
+            pad("b", 2, 100, vec![bump("x", (1000, 500), 2)]),
+        ];
+        let g = alignment_group(&pads, 0, 0, (0, 0), true);
+        assert_eq!(group_positions(&pads, &g, true), vec![(1, 900), (0, 1000)], "lower id first");
+    }
+
+    #[test]
+    fn a_pad_never_moves_backwards_and_the_budget_is_spent() {
+        assert_eq!(travel(500, 900, 1000), (900, 600), "moved 400, 600 left");
+        assert_eq!(travel(500, 300, 1000), (500, 1000), "cannot go back, nothing spent");
+        assert_eq!(travel(500, 5000, 200), (700, 0), "capped by the budget");
+    }
+
+    #[test]
+    fn a_flip_is_kept_unless_it_costs_more() {
+        assert!(keep_flip(100, 90, 2), "shorter, keep");
+        assert!(keep_flip(100, 100, 2), "⚠️ an exact tie keeps the flip");
+        assert!(!keep_flip(100, 110, 2), "longer, undo");
+        assert!(!keep_flip(100, 10, 1), "⚠️ one connection is never flipped");
+    }
+}
