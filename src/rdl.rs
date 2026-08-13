@@ -394,8 +394,30 @@ pub fn commit_route(graph: &mut Graph, route: &[Point], width: i32, spacing: i32
             }
         }
     }
+    // ⚠️ An edge can cross the corridor with **both endpoints outside it**, and those must go too.
+    // Testing only the edges of points inside the corridor leaves a wire's neighbours connected
+    // straight through it — the graph then offers routes that physically overlap an existing one,
+    // and the router succeeds where it should have had to find another way.
+    //
+    // Widening the search by the longest edge span keeps the candidate set a superset of what can
+    // reach in, which keeps this exact without visiting every edge in the graph.
+    let span = graph
+        .points
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &p)| graph.adj[i].iter().map(move |&(o, _)| (p, o)))
+        .map(|(p, o)| {
+            let q = graph.points[o];
+            (p.0 - q.0).abs().max((p.1 - q.1).abs())
+        })
+        .max()
+        .unwrap_or(0);
+
     for (i, &p) in graph.points.iter().enumerate() {
-        if !corridor.iter().any(|&r| hits(p, p, r)) {
+        let near = corridor
+            .iter()
+            .any(|&r| hits(p, p, (r.0 - span, r.1 - span, r.2 + span, r.3 + span)));
+        if !near {
             continue;
         }
         for &(o, _) in &graph.adj[i] {
@@ -763,6 +785,25 @@ pub struct Routed {
     pub failed: Vec<String>,
 }
 
+/// **L8** — is this access point too close to a route already committed?
+///
+/// Compares the box of `(width + spacing) / 2` around the point against the same-sized box around
+/// every point of every committed route.
+///
+/// ⚠️ Access points are **re-filtered before each attempt**, not computed once. A terminal's
+/// approaches are progressively closed off as wires are laid near it, and a router that keeps its
+/// original set will find paths that run over its neighbours — succeeding where it should have
+/// been forced to try elsewhere.
+pub fn access_blocked(point: Point, committed: &[&[Point]], width: i32, spacing: i32) -> bool {
+    let e = (width + spacing) / 2;
+    let near = (point.0 - e, point.1 - e, point.0 + e, point.1 + e);
+    committed.iter().any(|route| {
+        route
+            .iter()
+            .any(|&p| hits((p.0 - e, p.1 - e), (p.0 + e, p.1 + e), near))
+    })
+}
+
 /// **L7** — run every route to completion, rearranging when one cannot get through.
 ///
 /// The queue is drained in [`Route::precedes`] order. A route that connects is committed and its
@@ -805,8 +846,19 @@ pub fn route_all(
                 continue;
             };
             out.attempts += 1;
-            let a = insert_access(graph, grid, src.0, &src.1);
-            let b = insert_access(graph, grid, dst.0, &dst.1);
+            // ⚠️ Filtered against what is already on the die, every time.
+            let laid: Vec<&[Point]> =
+                routes.iter().filter(|r| r.routed).map(|r| r.points.as_slice()).collect();
+            let open = |snaps: &[Point]| -> Vec<Point> {
+                snaps
+                    .iter()
+                    .copied()
+                    .filter(|&p| !access_blocked(p, &laid, width, spacing))
+                    .collect()
+            };
+            let (src_open, dst_open) = (open(&src.1), open(&dst.1));
+            let a = insert_access(graph, grid, src.0, &src_open);
+            let b = insert_access(graph, grid, dst.0, &dst_open);
             let path = shortest_path(graph, src.0, dst.0, turn_penalty);
             graph.undo(&b);
             graph.undo(&a);
@@ -953,6 +1005,18 @@ mod tests {
             pending: true,
             points: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_access_point_next_to_a_committed_route_is_closed_off() {
+        // ⚠️ Recomputed before every attempt: a terminal's approaches close as wires are laid near
+        // it, and keeping the original set finds paths that run over the neighbours.
+        let laid = [(1000, 1000), (1000, 1100)];
+        let routes: Vec<&[Point]> = vec![&laid];
+        assert!(access_blocked((1000, 1050), &routes, 80, 80), "right on top of it");
+        assert!(access_blocked((1080, 1000), &routes, 80, 80), "within a width and a spacing");
+        assert!(!access_blocked((1400, 1000), &routes, 80, 80), "far enough away");
+        assert!(!access_blocked((1000, 1050), &[], 80, 80), "nothing committed yet");
     }
 
     #[test]
