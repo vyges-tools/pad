@@ -945,17 +945,28 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 if !seen.insert(t.terminal.clone()) {
                     continue;
                 }
-                let inst = t.terminal.rsplit_once('/').map(|(a, _)| a).unwrap_or("").to_string();
+                let (inst, pin) = t.terminal.rsplit_once('/').unwrap_or(("", ""));
+                let (inst, pin) = (inst.to_string(), pin.to_string());
                 let cover = db.master_is_cover(&db.inst_get_master(&inst));
+                // ⚠️ The ORDERING distance is measured between iterm bounding-box centres, which
+                // span every layer's pin shapes — not between the routing layer's target centres.
+                // The two coincide for a single-shape pin and diverge for a pad carrying several,
+                // which reorders whole groups rather than individual routes.
+                let bb = (
+                    db.iterm_get_b_box_x_min(&inst, &pin),
+                    db.iterm_get_b_box_y_min(&inst, &pin),
+                    db.iterm_get_b_box_x_max(&inst, &pin),
+                    db.iterm_get_b_box_y_max(&inst, &pin),
+                );
+                let iterm_id = db.iterm_id(&inst, &pin).unwrap_or(0) as u64;
                 dests.push(rdl::Dest {
                     terminal: t.terminal.clone(),
                     instance: inst,
-                    centre: t.centre,
+                    centre: ((bb.0 + bb.2) / 2, (bb.1 + bb.3) / 2),
                     cover,
-                    // ⚠️ A stand-in for odb's object id, which is not reachable across the
-                    // bridge. It only decides exact ties, and the tie count below says whether
-                    // any were hit.
-                    id: (i * 1000 + dests.len()) as u64,
+                    // The database's own identifier. It settles more than half the ordering on
+                    // this design, so a stand-in is not good enough.
+                    id: iterm_id,
                 });
             }
             for d in dests.clone() {
@@ -978,19 +989,39 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 });
             }
         }
-        routes.sort_by(|a, b| {
-            let o = a.precedes(b);
-            if o == std::cmp::Ordering::Equal {
-                ties += 1;
-            }
-            o
-        });
+        // ⚠️ Count ties on the DISTANCE, not on the comparator's result. `precedes` settles a
+        // distance tie by identifier and therefore never reports `Equal` — counting its `Equal`
+        // results measures nothing and will report zero however many ties there are.
+        {
+            let mut keys: Vec<i64> = routes
+                .iter()
+                .filter(|r| r.priority == 0)
+                .filter_map(|r| {
+                    r.peek().map(|d| {
+                        let (dx, dy) =
+                            ((r.centre.0 - d.centre.0) as i64, (r.centre.1 - d.centre.1) as i64);
+                        dx * dx + dy * dy
+                    })
+                })
+                .collect();
+            keys.sort_unstable();
+            ties = keys.windows(2).filter(|w| w[0] == w[1]).count();
+        }
+        routes.sort_by(|a, b| a.precedes(b));
+        // The reference logs TARGET centres, so report those rather than the ordering centres.
+        let target_of: std::collections::HashMap<String, (i32, i32)> = nets
+            .iter()
+            .flat_map(|n| rdl_targets(&db, n, &layer))
+            .map(|t| (t.terminal, t.centre))
+            .collect();
         let body: String = routes
             .iter()
-            .take(40)
+            .take(300)
             .map(|r| {
                 let d = r.peek().unwrap();
-                format!("{} {} -> {} {}\n", r.centre.0, r.centre.1, d.centre.0, d.centre.1)
+                let s = target_of.get(&r.source).copied().unwrap_or(r.centre);
+                let t = target_of.get(&d.terminal).copied().unwrap_or(d.centre);
+                format!("{} {} -> {} {}\n", s.0, s.1, t.0, t.1)
             })
             .collect();
         eprintln!("routes: {}  ordering ties hit: {ties}", routes.len());
