@@ -15,7 +15,10 @@ use vyges_pad::{bumps, corner_placement, intersects, corner_row_names, make_rows
     outline_of, place_in_row, refuse, snap_to_site, transform, Blocker, Offsets, Orient,
     Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
 use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
-use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
+use vyges_pad::pads::{
+    alignment_group, fits, group_positions, keep_flip, place_one, place_uniform, travel, Bump,
+    BumpPad, Pad, Refused, Track,
+};
 use vyges_pad::fill::{fill_row, Filler, Unfilled};
 use vyges_pad::rdl;
 use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, PadInst, Terminal};
@@ -1810,6 +1813,102 @@ fn unsupported_or_error(message: &str) -> ExitCode {
     ExitCode::from(if message.starts_with(UNSUPPORTED) { 3 } else { 2 })
 }
 
+/// The bumps each pad shares a **non-supply** net with, in terminal id order.
+///
+/// ⚠️ Supply nets are skipped: a pad and a bump both on `VDD` meet through the power grid, and
+/// aligning to that would drag the whole row onto the power bumps.
+fn bump_pads(db: &Db, track: &Track, pads: &[Pad]) -> Vec<BumpPad> {
+    pads.iter()
+        .map(|p| {
+            let mut bumps: Vec<Bump> = Vec::new();
+            for iterm in db.inst_get_i_terms(&p.name) {
+                let Some((_, pin)) = iterm.rsplit_once('/') else { continue };
+                let net = db.iterm_get_net(&p.name, pin);
+                if net.is_empty()
+                    || matches!(db.net_get_sig_type(&net).as_str(), "POWER" | "GROUND")
+                {
+                    continue;
+                }
+                for other in db.net_get_i_terms(&net) {
+                    let Some((owner, opin)) = other.rsplit_once('/') else { continue };
+                    if !db.master_is_cover(&db.inst_get_master(owner)) {
+                        continue;
+                    }
+                    let bb = (
+                        db.iterm_get_b_box_x_min(owner, opin),
+                        db.iterm_get_b_box_y_min(owner, opin),
+                        db.iterm_get_b_box_x_max(owner, opin),
+                        db.iterm_get_b_box_y_max(owner, opin),
+                    );
+                    bumps.push(Bump {
+                        terminal: other.clone(),
+                        centre: ((bb.0 + bb.2) / 2, (bb.1 + bb.3) / 2),
+                        id: db.iterm_id(owner, opin).unwrap_or(0) as u64,
+                    });
+                }
+            }
+            bumps.sort_by_key(|b| b.id);
+            bumps.dedup_by_key(|b| b.terminal.clone());
+            BumpPad {
+                name: p.name.clone(),
+                id: db.inst_id(&p.name).unwrap_or(0) as u64,
+                width: vyges_pad::pad_width(track, p.size),
+                bumps,
+            }
+        })
+        .collect()
+}
+
+/// **BA1-BA5** — place a row so its pads sit under the bumps they serve.
+fn place_bump_aligned(
+    track: &Track,
+    pads: &[Pad],
+    aligned: &[BumpPad],
+    conflict: &mut dyn FnMut(&str, Rect, Orient) -> Option<vyges_pad::Refusal>,
+    settled: &mut dyn FnMut(&Placement),
+) -> Result<Vec<Placement>, Refused> {
+    let horizontal = track.horizontal();
+    let bbox = track.row.bbox;
+    let row_centre = ((bbox.0 + bbox.2) / 2, (bbox.1 + bbox.3) / 2);
+    let total: i32 = aligned.iter().map(|p| p.width).sum();
+    let mut budget = track.width() - total;
+    let mut offset = track.start();
+    let mut out = Vec::new();
+    let mut k = 0usize;
+
+    while k < pads.len() {
+        let group = alignment_group(aligned, k, offset, row_centre, horizontal);
+        // A pad with no bump simply takes the next place going.
+        let wanted: Vec<(usize, i32)> = if group.is_empty() {
+            vec![(k, 0)]
+        } else {
+            group_positions(aligned, &group, horizontal)
+        };
+        let step = wanted.len();
+        for (i, want) in wanted {
+            let (at, left) = travel(offset, want, budget);
+            budget = left;
+            let p = place_one(
+                track,
+                track.snap_to_site(at),
+                &pads[i],
+                Orient::R0,
+                false,
+                true,
+                conflict,
+            )?;
+            settled(&p);
+            // ⚠️ The cursor follows where the pad actually LANDED, unlike the uniform placer's
+            // ideal cursor: an aligned row is a chain, and a pad that slid moves its successors.
+            let (_, end) = track.along((p.x, p.y, p.x + 1, p.y + 1));
+            offset = end.max(at) + vyges_pad::pad_width(track, pads[i].size);
+            out.push(p);
+        }
+        k += step.max(1);
+    }
+    Ok(out)
+}
+
 /// **P5** — spread a list of pads along one side of the ring.
 fn place_pads(args: &[String]) -> ExitCode {
     let (opts, mut db) = match open(args) {
@@ -1857,9 +1956,7 @@ fn place_pads(args: &[String]) -> ExitCode {
                 eprintln!("vyges-pad: no pad connects to a bump, placing uniformly instead");
                 None
             }
-            ("default" | "bump_aligned", true) => {
-                return Err(UNSUPPORTED.to_string() + "bump-aligned placement")
-            }
+            ("default" | "bump_aligned", true) => Some(i32::MIN), // marker: bump-aligned
             ("placer", _) => return Err(UNSUPPORTED.to_string() + "the annealing placer"),
             (other, _) => return Err(format!("`{other}` is not a placement mode")),
         };
@@ -1910,7 +2007,13 @@ fn place_pads(args: &[String]) -> ExitCode {
             shapes: Vec::new(),
         });
     };
-    let result = place_uniform(&track, &pads, max_spacing, &mut conflict, &mut settle);
+    // ⚠️ `i32::MIN` is the marker set above for bump-aligned mode, not a spacing.
+    let result = if max_spacing == Some(i32::MIN) {
+        let aligned = bump_pads(&db, &track, &pads);
+        place_bump_aligned(&track, &pads, &aligned, &mut conflict, &mut settle)
+    } else {
+        place_uniform(&track, &pads, max_spacing, &mut conflict, &mut settle)
+    };
 
     let placed = match result {
         Ok(v) => v,
