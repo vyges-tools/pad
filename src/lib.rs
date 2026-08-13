@@ -16,4 +16,4 @@ pub mod orient;
 pub mod ring;
 
 pub use orient::Orient;
-pub use ring::{make_rows, Offsets, Row, RowDir, Site};
+pub use ring::{make_rows, row_name, Offsets, Rotations, Row, RowDir, Site};
