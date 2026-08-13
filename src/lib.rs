@@ -27,6 +27,7 @@ pub mod fill;
 pub mod orient;
 pub mod pads;
 pub mod place;
+pub mod rdl;
 pub mod ring;
 
 pub use orient::Orient;
@@ -41,4 +42,5 @@ pub use place::{
     corner_placement, corner_row_names, mirror_base, oriented_size, overlaps, place_in_row,
     snap_to_site, Edge, Placement, RowGeom,
 };
+pub use rdl::{edges as rdl_edges, grid as rdl_grid, thin, Grid};
 pub use ring::{make_rows, row_name, Offsets, Rotations, Row, RowDir, Site};

@@ -17,6 +17,7 @@ use vyges_pad::{bumps, corner_placement, intersects, corner_row_names, make_rows
 use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
 use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
 use vyges_pad::fill::{fill_row, Filler, Unfilled};
+use vyges_pad::rdl;
 use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, PadInst, Terminal};
 use vyges_pad::bond::{bond_shape, is_bond_master, matching, pin_shape, place as bond_place};
 use vyges_pad::assign::{assign, BumpTerm, Refused as AssignRefused};
@@ -37,6 +38,8 @@ USAGE:
                               [--permit-overlaps 'M'] [options]
   vyges loom pad place-io-terminals <design.odb> --pins 'PATTERN...'
                                    [--allow-non-top-layer] [options]
+  vyges loom pad rdl-route <design.odb> --layer L [--width W] [--spacing S]
+                          [--allow45] [--grid-only] [options]
   vyges loom pad assign-io-bump <design.odb> --bump INST --net N
                                [--terminal INST/PIN] [--dont-route] [options]
   vyges loom pad connect-by-abutment <design.odb> [options]
@@ -161,6 +164,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             // value, so an unlisted flag silently swallows the argument after it.
             "--allow-non-top-layer" => o.keys.push(("allow-non-top-layer".into(), "1".into())),
             "--dont-route" => o.keys.push(("dont-route".into(), "1".into())),
+            "--allow45" => o.keys.push(("allow45".into(), "1".into())),
+            "--fixed" => o.keys.push(("fixed".into(), "1".into())),
+            "--grid-only" => o.keys.push(("grid-only".into(), "1".into())),
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -766,6 +772,64 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
         db.bterm_set_sig_type(&bterm, &sig).map_err(|e| format!("cannot type {bterm}: {e}"))?;
     }
     db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
+}
+
+/// **G1-G5** — the RDL routing grid.
+///
+/// ⚠️ Only the grid. The search, obstructions and rip-up are later stages, and asking for a route
+/// exits 3 rather than producing one this engine cannot yet stand behind.
+fn rdl_route(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let dbu = db.dbu_per_micron();
+
+    let built = (|| -> Result<rdl::Grid, String> {
+        let layer = opts.need("layer")?;
+        let um = |k: &str| -> Result<i32, String> {
+            match opts.get(k) {
+                None => Ok(0),
+                Some(v) => v
+                    .parse::<f64>()
+                    .map(|n| (n * dbu as f64).round() as i32)
+                    .map_err(|_| format!("--{k} wants a number, got `{v}`")),
+            }
+        };
+        let (width, spacing) = (um("width")?, um("spacing")?);
+        let (tx, ty) = db
+            .track_grid(layer)
+            .map_err(|e| format!("no track grid on `{layer}`: {e}"))?;
+        Ok(rdl::grid(&tx, &ty, width, spacing))
+    })();
+
+    let g = match built {
+        Ok(v) => v,
+        Err(e) => return unsupported_or_error(&e),
+    };
+    let allow45 = opts.get("allow45").is_some();
+    let report = format!(
+        "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"rdl-grid\",\n  \"status\": \"ok\",\n  \
+         \"vertices\": {},\n  \"edges\": {},\n  \"columns\": {},\n  \"rows\": {}\n}}",
+        g.vertices(),
+        rdl::edges(&g, allow45).len(),
+        g.x.len(),
+        g.y.len(),
+    );
+    match opts.get("o") {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, format!("{report}\n")) {
+                eprintln!("vyges-pad: cannot write {path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => println!("{report}"),
+    }
+    if opts.get("grid-only").is_some() {
+        return ExitCode::SUCCESS;
+    }
+    let _ = &mut db;
+    unsupported_or_error(&(UNSUPPORTED.to_string() + "RDL routing (the grid is built; the search is not)"))
 }
 
 /// **B1** — assign a net to a bump.
@@ -1787,6 +1851,7 @@ fn main() -> ExitCode {
         Some("place-io-fill") => place_io_fill(&args[1..]),
         Some("place-io-terminals") => place_io_terminals(&args[1..]),
         Some("assign-io-bump") => assign_io_bump(&args[1..]),
+        Some("rdl-route") => rdl_route(&args[1..]),
         Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),
