@@ -1874,19 +1874,7 @@ fn place_force_directed(
     let row = (track.start(), track.end());
     let along = |c: (i32, i32)| if horizontal { c.0 } else { c.1 };
 
-    // ── Ideal positions, and a crude start for pads that serve no bump ───────────────────────
-    let mut targets: Vec<i32> = Vec::with_capacity(pads.len());
-    for (i, a) in aligned.iter().enumerate() {
-        let centres: Vec<i32> = a.bumps.iter().map(|b| along(b.centre)).collect();
-        // ⚠️ The row bounds here are inset by half the pad, as in the reference: everything in
-        // this stage is a centre coordinate.
-        let inset = (row.0 + a.width / 2, row.1 - a.width / 2);
-        let t = ideal_position(&centres).unwrap_or_else(|| {
-            vyges_pad::spread::unconstrained_start(i, pads.len(), &targets, inset)
-        });
-        targets.push(t);
-    }
-
+    let snap = |p: i32| track.index_to_pos(track.snap_to_site(p));
     // What **this** pad, centred here, would run into — as an extent along the row.
     //
     // ⚠️ Per pad, not one probe for the row. Pads differ in width and each is excused its own
@@ -1905,6 +1893,29 @@ fn place_force_directed(
         conflict_probe(&pad.name, bbox).map(|r| if horizontal { (r.0, r.2) } else { (r.1, r.3) })
     };
 
+    // ── Ideal positions, and a crude start for pads that serve no bump ───────────────────────
+    let mut targets: Vec<i32> = Vec::with_capacity(pads.len());
+    for (i, a) in aligned.iter().enumerate() {
+        let centres: Vec<i32> = a.bumps.iter().map(|b| along(b.centre)).collect();
+        // ⚠️ The row bounds here are inset by half the pad, as in the reference: everything in
+        // this stage is a centre coordinate.
+        let inset = (row.0 + a.width / 2, row.1 - a.width / 2);
+        // ⚠️ The ideal is **legalised as it is computed**, not later. A mean of two bump centres
+        // can land squarely on an obstruction, and every stage after this takes it as the thing to
+        // pull towards. Legalising only at the end asks the spread to undo a target it was told to
+        // aim at.
+        let t = ideal_position(&centres)
+            .map(|m| {
+                let half = vyges_pad::pad_width(track, pads[i].size) / 2;
+                vyges_pad::spread::nearest_legal(m, blocked(i, m), half, row)
+            })
+            .unwrap_or_else(|| {
+                vyges_pad::spread::unconstrained_start(i, pads.len(), &targets, inset)
+            });
+        targets.push(t);
+    }
+
+
     // ── Restore order along the row ──────────────────────────────────────────────────────────
     let mut ordered = targets.clone();
     let mut weights = vec![1.0f32; ordered.len()];
@@ -1920,12 +1931,15 @@ fn place_force_directed(
 
     // ── Spread until nothing overlaps ────────────────────────────────────────────────────────
     let site = track.site_width.max(1);
+    // ⚠️ Anchors start **snapped to a site**. The regression works in continuous coordinates and
+    // the spread moves in whole sites, so an unsnapped start leaves every position permanently
+    // offset by a fraction of a site — small enough to look like rounding, large enough to put a
+    // pad on the wrong side of an obstruction edge.
     let mut anchors: Vec<Anchor> = ordered
         .iter()
         .zip(aligned)
-        .map(|(&pos, a)| Anchor::at(pos - a.width / 2, a.width))
+        .map(|(&pos, a)| Anchor::at(snap(pos - a.width / 2), a.width))
         .collect();
-    let snap = |p: i32| track.index_to_pos(track.snap_to_site(p));
     for k in 0..MAX_ITERATIONS {
         let (spring, repel) = forces(k);
         if !spread_pass(&mut anchors, &ordered, row, spring, repel, DAMPER, site, &snap, &blocked) {
