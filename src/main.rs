@@ -16,7 +16,8 @@ use vyges_pad::{bumps, corner_placement, intersects, corner_row_names, make_rows
     Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
 use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
 use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
-use vyges_pad::abut::{connect_by_abutment, special_sig_type, PadInst, Terminal};
+use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, PadInst, Terminal};
+use vyges_pad::bond::{bond_shape, is_bond_master, matching, pin_shape, place as bond_place};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
@@ -31,6 +32,8 @@ USAGE:
                                    --columns N --pitch 'DX [DY]' [--prefix P] [options]
   vyges loom pad place-pads <design.odb> --row R --insts 'A B C' [--mode M] [options]
   vyges loom pad connect-by-abutment <design.odb> [options]
+  vyges loom pad place-bondpad <design.odb> --bond M --insts 'PATTERN...'
+                               [--offset 'X Y'] [--rotation R] [--prefix P] [options]
   vyges loom pad remove-io-bump <design.odb> --inst NAME [options]
   vyges loom pad remove-io-bump-array <design.odb> --bump M [options]
   vyges loom pad --describe
@@ -668,51 +671,55 @@ fn pad_insts(db: &Db) -> Vec<PadInst> {
             {
                 continue;
             }
-            let master = db.inst_get_master(name);
-            if db.master_is_cover(&master) {
+            if db.master_is_cover(&db.inst_get_master(name)) {
                 continue;
             }
-            let Ok(b) = db.inst_bbox(name) else { continue };
-            let [x0, y0, x1, y1] = b[..] else { continue };
-            let bbox = (x0, y0, x1, y1);
+            let Some(inst) = read_inst(db, name) else { continue };
             // ⚠️ `intersects` here is the strict test: a cell merely grazing a row's edge is not
             // in that row. This is the clearance predicate, not the abutment one.
-            if !intersects(bbox, r) {
+            if !intersects(inst.bbox, r) {
                 continue;
             }
-
-            let Ok((mw, mh)) = master_size(db, &master) else { continue };
-            let orient = Orient::parse(&db.inst_get_orient(name)).unwrap_or(Orient::R0);
-            let terms = db
-                .master_get_m_terms(&master)
-                .into_iter()
-                .map(|term| {
-                    let shapes = db
-                        .mterm_pin_boxes(&master, &term)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(layer, a, b, c, d)| {
-                            (layer, transform((a, b, c, d), (mw, mh), orient, (x0, y0)))
-                        })
-                        .collect();
-                    let net = db.iterm_get_net(name, &term);
-                    Terminal {
-                        supply: matches!(
-                            db.iterm_get_sig_type(name, &term).as_str(),
-                            "POWER" | "GROUND"
-                        ),
-                        name: term,
-                        shapes,
-                        net: (!net.is_empty()).then_some(net),
-                    }
-                })
-                .collect();
             // ⚠️ A cell reaching into two rows is collected TWICE, deliberately: the reference
             // does the same, and deduplicating would change the order everything below depends on.
-            out.push(PadInst { name: name.clone(), bbox, terms });
+            out.push(inst);
         }
     }
     out
+}
+
+/// One instance with its terminals' shapes moved onto the die.
+///
+/// The single place that reads an instance's geometry. Both the abutment census and the bond-pad
+/// pairing use it: a second copy would be free to drift from this one, silently.
+fn read_inst(db: &Db, name: &str) -> Option<PadInst> {
+    let master = db.inst_get_master(name);
+    let b = db.inst_bbox(name).ok()?;
+    let [x0, y0, x1, y1] = b[..] else { return None };
+    let (mw, mh) = master_size(db, &master).ok()?;
+    let orient = Orient::parse(&db.inst_get_orient(name)).unwrap_or(Orient::R0);
+    let terms = db
+        .master_get_m_terms(&master)
+        .into_iter()
+        .map(|term| {
+            let shapes = db
+                .mterm_pin_boxes(&master, &term)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(layer, a, b, c, d)| {
+                    (layer, transform((a, b, c, d), (mw, mh), orient, (x0, y0)))
+                })
+                .collect();
+            let net = db.iterm_get_net(name, &term);
+            Terminal {
+                supply: matches!(db.iterm_get_sig_type(name, &term).as_str(), "POWER" | "GROUND"),
+                name: term,
+                shapes,
+                net: (!net.is_empty()).then_some(net),
+            }
+        })
+        .collect();
+    Some(PadInst { name: name.to_string(), bbox: (x0, y0, x1, y1), terms })
 }
 
 /// **A6** — mark a net special, and settle its signal type.
@@ -740,6 +747,169 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
         db.bterm_set_sig_type(&bterm, &sig).map_err(|e| format!("cannot type {bterm}: {e}"))?;
     }
     db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
+}
+
+/// **D3** — a bond pad on top of every selected pad.
+fn place_bondpad(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let dbu = db.dbu_per_micron();
+
+    let setup = (|| -> Result<(String, String, Rect, (i32, i32), Orient, String), String> {
+        let bond = opts.need("bond")?.to_string();
+        let class = db.master_get_type(&bond).unwrap_or_default();
+        if class.is_empty() {
+            return Err(format!("no master named `{bond}` in this design"));
+        }
+        if !is_bond_master(&class) {
+            return Err(format!("{bond} is `{class}`, not a COVER cell"));
+        }
+
+        // The bond layer: the highest routing layer the master puts a pin on.
+        let mut pins = Vec::new();
+        for term in db.master_get_m_terms(&bond) {
+            for (layer, x0, y0, x1, y1) in db.mterm_pin_boxes(&bond, &term).unwrap_or_default() {
+                let name = db.layer_name_by_number(layer);
+                let level = db.layer_get_routing_level(&name);
+                pins.push((name, level, (x0, y0, x1, y1)));
+            }
+        }
+        let (layer, rect) =
+            bond_shape(&pins).ok_or_else(|| format!("cannot find the top layer of {bond}"))?;
+
+        let offset = match opts.get("offset") {
+            None => (0, 0),
+            Some(v) => {
+                let n: Vec<f64> = v.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                match n[..] {
+                    [x, y] => ((x * dbu as f64).round() as i32, (y * dbu as f64).round() as i32),
+                    _ => return Err("--offset must be specified as `x y`".into()),
+                }
+            }
+        };
+        let rotation = rotation(&opts, "rotation")?;
+        let prefix = opts.get("prefix").unwrap_or(vyges_pad::bond::DEFAULT_PREFIX).to_string();
+        Ok((bond, layer, rect, offset, rotation, prefix))
+    })();
+
+    let (bond, layer, bond_rect, offset, rotation, prefix) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let patterns: Vec<String> = match opts.need("insts") {
+        Ok(v) => v.split_whitespace().map(str::to_string).collect(),
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let all = db.inst_names();
+    let chosen: Vec<String> = matching(&all, &patterns).into_iter().cloned().collect();
+    if chosen.is_empty() {
+        eprintln!("vyges-pad: no instances matched {}", patterns.join(" "));
+        return ExitCode::from(2);
+    }
+
+    let mut placed = Vec::new();
+    let mut wired: Vec<(String, String, String)> = Vec::new(); // (bond inst, term, net)
+    for pad in &chosen {
+        // ⚠️ Only a FIXED pad gets a bond pad. One still floating has no settled place to sit on.
+        if !matches!(db.inst_get_placement_status(pad).as_str(), "FIRM" | "LOCKED" | "COVER") {
+            continue;
+        }
+        let pad_orient = Orient::parse(&db.inst_get_orient(pad)).unwrap_or(Orient::R0);
+        let origin = (db.inst_get_origin_x(pad), db.inst_get_origin_y(pad));
+        let b = bond_place(pad, origin, pad_orient, &bond, offset, rotation, &prefix);
+
+        if !opts.dry_run {
+            let made = (|| -> Result<(), String> {
+                db.create_inst(&b.master, &b.name).map_err(|e| format!("{}: {e}", b.name))?;
+                db.inst_set_orient(&b.name, &format!("{:?}", b.orient))
+                    .map_err(|e| format!("{}: {e}", b.name))?;
+                // ⚠️ `set_origin`, not `set_location`: the reference sets the transform origin, and
+                // the two differ for every orientation but R0.
+                db.inst_set_origin(&b.name, b.origin.0, b.origin.1)
+                    .map_err(|e| format!("{}: {e}", b.name))?;
+                db.inst_set_placement_status(&b.name, "FIRM")
+                    .map_err(|e| format!("{}: {e}", b.name))
+            })();
+            if let Err(e) = made {
+                eprintln!("vyges-pad: cannot create {e}");
+                return ExitCode::from(2);
+            }
+            for (term, net) in touching_nets(&db, pad, &b.name) {
+                wired.push((b.name.clone(), term, net));
+            }
+        }
+        placed.push(Placement {
+            name: b.name,
+            master: b.master,
+            x: b.origin.0,
+            y: b.origin.1,
+            orient: b.orient,
+        });
+    }
+
+    if !opts.dry_run {
+        let joined = (|| -> Result<(), String> {
+            for (inst, term, net) in &wired {
+                db.connect(inst, term, net)
+                    .map_err(|e| format!("cannot connect {inst}/{term} to {net}: {e}"))?;
+                // The shape that makes this net reachable from outside the die, placed by the
+                // bond pad's OWN transform -- orientation and origin, not its bounding box.
+                let orient = Orient::parse(&db.inst_get_orient(inst)).unwrap_or(Orient::R0);
+                let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+                let shape = pin_shape(bond_rect, orient, origin);
+                make_bterm(&mut db, net, &layer, shape)?;
+                make_special(&mut db, net)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = joined {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    finish(&opts, &mut db, "bondpad", &placed, &[])
+}
+
+/// The nets a bond pad picks up from the pad underneath it, by terminals that touch.
+fn touching_nets(db: &Db, pad: &str, bond: &str) -> Vec<(String, String)> {
+    let (Some(a), Some(b)) = (read_inst(db, pad), read_inst(db, bond)) else {
+        return Vec::new();
+    };
+    touching_terms(&a, &b)
+        .into_iter()
+        .filter_map(|(i, j)| {
+            // The net comes from the PAD's terminal; the bond pad is what joins it.
+            a.terms[i].net.clone().map(|net| (b.terms[j].name.clone(), net))
+        })
+        .collect()
+}
+
+/// **D5** — give a net a block terminal shape, making one if the net has none.
+///
+/// ℹ️ The create-a-terminal path is not exercised by any reference case: every net that reaches
+/// here already has one. It is implemented rather than left to fail, and said to be untested.
+fn make_bterm(db: &mut Db, net: &str, layer: &str, shape: Rect) -> Result<(), String> {
+    let mut bterm = db.net_get1st_b_term(net);
+    if bterm.is_empty() {
+        db.create_bterm(net, net).map_err(|e| format!("cannot make a terminal for {net}: {e}"))?;
+        bterm = db.net_get1st_b_term(net);
+    }
+    let sig = db.net_get_sig_type(net);
+    db.bterm_set_sig_type(&bterm, &sig).map_err(|e| format!("cannot type {bterm}: {e}"))?;
+    let idx = db
+        .create_bterm_pin(&bterm, layer, shape)
+        .map_err(|e| format!("cannot add a pin to {bterm}: {e}"))?;
+    db.bpin_set_placement_status(&bterm, idx, "FIRM")
+        .map_err(|e| format!("cannot fix {bterm} pin {idx}: {e}"))
 }
 
 /// **A4** — wire the ring by abutment.
@@ -1270,6 +1440,7 @@ fn main() -> ExitCode {
         Some("place-pad") => place_pad(&args[1..]),
         Some("place-pads") => place_pads(&args[1..]),
         Some("connect-by-abutment") => connect_ring(&args[1..]),
+        Some("place-bondpad") => place_bondpad(&args[1..]),
         Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),

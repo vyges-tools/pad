@@ -39,7 +39,10 @@ impl Orient {
     ///
     /// The whole algebra is derived from this one table, so composition cannot drift out of step
     /// with the geometry the way two hand-written tables would.
-    fn apply(self, x: i32, y: i32) -> (i32, i32) {
+    ///
+    /// ⚠️ A **direction**, with no translation. Applying it to an offset turns the offset; applying
+    /// it to a position would move that position relative to the origin of the die.
+    pub fn apply(self, x: i32, y: i32) -> (i32, i32) {
         match self {
             R0 => (x, y),
             R90 => (-y, x),
