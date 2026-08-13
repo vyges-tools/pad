@@ -44,11 +44,28 @@ pub struct Blocker {
 
 /// Why a placement was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Refusal {
+pub enum Reason {
+    /// A placement blockage. It has no layer and no owner: it forbids cells outright.
+    Blockage,
     /// The cell's box hits a fixed instance's box, and no outline saved it.
     Instance(String),
     /// The cell's metal is too close to something else's on the same layer.
     Layer { blocker: String, layer: String },
+}
+
+/// A refusal, and **where** the conflict is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub reason: Reason,
+    /// ⚠️ The **intersection** with the cell's box, not the blocker's own box. Callers that shift
+    /// a cell along a row snap to where the overlap *starts*; the blocker's box can begin far
+    /// behind the cell, which would shift it backwards rather than clear of the obstacle.
+    pub overlap: Rect,
+}
+
+/// The shared area of two rectangles. Meaningless unless they intersect.
+fn overlap_of(a: Rect, b: Rect) -> Rect {
+    (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3))
 }
 
 /// Do two rectangles share area? Touching is not overlapping.
@@ -111,8 +128,18 @@ pub fn refuse(
     cell_outline: &[Rect],
     cell_shapes: &[Shape],
     blockers: &[Blocker],
+    blockages: &[Rect],
     spacing_of: &dyn Fn(&str) -> i32,
 ) -> Option<Refusal> {
+    // ── 1. Placement blockages, first and unconditionally ────────────────────────────────────
+    // ⚠️ Order is part of the answer, not a detail. The caller shifts to the first conflict it is
+    // told about, so checking instances before blockages would shift to a different site.
+    for &g in blockages {
+        if intersects(cell_bbox, g) {
+            return Some(Refusal { reason: Reason::Blockage, overlap: overlap_of(cell_bbox, g) });
+        }
+    }
+
     // ── 2. Fixed instances, by box then refined by outline ───────────────────────────────────
     for b in blockers.iter().filter(|b| b.by_box) {
         if b.name == cell_name || !intersects(cell_bbox, b.bbox) {
@@ -128,7 +155,10 @@ pub fn refuse(
             (true, true) => true,
         };
         if refined {
-            return Some(Refusal::Instance(b.name.clone()));
+            return Some(Refusal {
+                reason: Reason::Instance(b.name.clone()),
+                overlap: overlap_of(cell_bbox, b.bbox),
+            });
         }
     }
 
@@ -146,9 +176,15 @@ pub fn refuse(
                 let nets_match =
                     s.net.is_some() && other.net.is_some() && s.net == other.net;
                 if !nets_match && intersects(grown, other.rect) {
-                    return Some(Refusal::Layer {
-                        blocker: b.name.clone(),
-                        layer: s.layer.clone(),
+                    return Some(Refusal {
+                        // ⚠️ The overlap is measured against the cell's BOX, not its grown shape:
+                        // the shape may reach outside the cell, and a shift target taken from
+                        // there would move the cell further than the conflict requires.
+                        overlap: overlap_of(cell_bbox, other.rect),
+                        reason: Reason::Layer {
+                            blocker: b.name.clone(),
+                            layer: s.layer.clone(),
+                        },
                     });
                 }
             }
@@ -184,17 +220,17 @@ mod tests {
     fn a_fixed_instance_in_the_way_refuses_the_placement() {
         let b = [fixed("OVERLAP", (80, 80, 120, 120))];
         assert_eq!(
-            refuse("C", (70, 70, 350, 350), &[], &[], &b, &no_spacing),
-            Some(Refusal::Instance("OVERLAP".into()))
+            refuse("C", (70, 70, 350, 350), &[], &[], &b, &[], &no_spacing).map(|r| r.reason),
+            Some(Reason::Instance("OVERLAP".into()))
         );
-        assert_eq!(refuse("C", (500, 500, 600, 600), &[], &[], &b, &no_spacing), None);
+        assert_eq!(refuse("C", (500, 500, 600, 600), &[], &[], &b, &[], &no_spacing), None);
     }
 
     #[test]
     fn a_cell_never_blocks_itself() {
         // Re-placing an instance that already exists must not refuse the position it holds.
         let b = [fixed("C", (0, 0, 100, 100))];
-        assert_eq!(refuse("C", (0, 0, 100, 100), &[], &[], &b, &no_spacing), None);
+        assert_eq!(refuse("C", (0, 0, 100, 100), &[], &[], &b, &[], &no_spacing), None);
     }
 
     #[test]
@@ -203,11 +239,11 @@ mod tests {
         // sitting in the notch. Boxes say conflict; outlines say no.
         let b = [fixed("IN_THE_NOTCH", (10, 10, 40, 40))];
         let cell_box = (0, 0, 200, 200);
-        assert!(refuse("C", cell_box, &[], &[], &b, &no_spacing).is_some(), "by box, refused");
+        assert!(refuse("C", cell_box, &[], &[], &b, &[], &no_spacing).is_some(), "by box, refused");
 
         let l_shape = [(0, 50, 200, 200), (50, 0, 200, 200)];
         assert_eq!(
-            refuse("C", cell_box, &l_shape, &[], &b, &no_spacing),
+            refuse("C", cell_box, &l_shape, &[], &b, &[], &no_spacing),
             None,
             "by outline, allowed"
         );
@@ -218,10 +254,10 @@ mod tests {
         let mut b = fixed("HOLLOW", (0, 0, 200, 200));
         b.outline = vec![(0, 0, 20, 200)]; // only its left strip is real
         let blockers = [b];
-        assert_eq!(refuse("C", (100, 100, 150, 150), &[], &[], &blockers, &no_spacing), None);
+        assert_eq!(refuse("C", (100, 100, 150, 150), &[], &[], &blockers, &[], &no_spacing), None);
         assert_eq!(
-            refuse("C", (10, 100, 15, 150), &[], &[], &blockers, &no_spacing),
-            Some(Refusal::Instance("HOLLOW".into()))
+            refuse("C", (10, 100, 15, 150), &[], &[], &blockers, &[], &no_spacing).map(|r| r.reason),
+            Some(Reason::Instance("HOLLOW".into()))
         );
     }
 
@@ -229,7 +265,7 @@ mod tests {
     fn no_outline_is_not_an_empty_outline() {
         // The distinction that would let everything overlap everything if collapsed.
         let b = [fixed("SOLID", (0, 0, 100, 100))];
-        assert!(refuse("C", (50, 50, 150, 150), &[], &[], &b, &no_spacing).is_some());
+        assert!(refuse("C", (50, 50, 150, 150), &[], &[], &b, &[], &no_spacing).is_some());
     }
 
     #[test]
@@ -246,13 +282,13 @@ mod tests {
         let blockers = [bump];
 
         let on_m4 = [shape("metal4", (20, 20, 80, 80))];
-        assert_eq!(refuse("C", (0, 0, 100, 100), &[], &on_m4, &blockers, &no_spacing), None,
+        assert_eq!(refuse("C", (0, 0, 100, 100), &[], &on_m4, &blockers, &[], &no_spacing), None,
                    "different layers cannot conflict");
 
         let on_m10 = [shape("metal10", (20, 20, 80, 80))];
         assert_eq!(
-            refuse("C", (0, 0, 100, 100), &[], &on_m10, &blockers, &no_spacing),
-            Some(Refusal::Layer { blocker: "BUMP".into(), layer: "metal10".into() })
+            refuse("C", (0, 0, 100, 100), &[], &on_m10, &blockers, &[], &no_spacing).map(|r| r.reason),
+            Some(Reason::Layer { blocker: "BUMP".into(), layer: "metal10".into() })
         );
     }
 
@@ -268,10 +304,10 @@ mod tests {
         };
         let blockers = [other];
         let cell = [shape("metal1", (0, 0, 90, 100))];
-        assert_eq!(refuse("C", (0, 0, 90, 100), &[], &cell, &blockers, &no_spacing), None,
+        assert_eq!(refuse("C", (0, 0, 90, 100), &[], &cell, &blockers, &[], &no_spacing), None,
                    "ten apart, and no spacing required");
         assert!(
-            refuse("C", (0, 0, 90, 100), &[], &cell, &blockers, &|_| 20).is_some(),
+            refuse("C", (0, 0, 90, 100), &[], &cell, &blockers, &[], &|_| 20).is_some(),
             "ten apart, twenty required"
         );
     }
@@ -292,14 +328,41 @@ mod tests {
             by_box: false,
             shapes: vec![mk(Some("VDD"))],
         }];
-        assert_eq!(refuse("C", (0, 0, 1, 1), &[], &[mk(Some("VDD"))], &same, &no_spacing), None);
-        assert!(refuse("C", (0, 0, 1, 1), &[], &[mk(Some("VSS"))], &same, &no_spacing).is_some());
+        assert_eq!(refuse("C", (0, 0, 1, 1), &[], &[mk(Some("VDD"))], &same, &[], &no_spacing), None);
+        assert!(refuse("C", (0, 0, 1, 1), &[], &[mk(Some("VSS"))], &same, &[], &no_spacing).is_some());
         // ⚠️ Two unconnected shapes do NOT match — "no net" is not a net they share.
-        assert!(refuse("C", (0, 0, 1, 1), &[], &[mk(None)], &same, &no_spacing).is_some());
+        assert!(refuse("C", (0, 0, 1, 1), &[], &[mk(None)], &same, &[], &no_spacing).is_some());
         let unconnected = [Blocker { shapes: vec![mk(None)], ..same[0].clone() }];
         assert!(
-            refuse("C", (0, 0, 1, 1), &[], &[mk(None)], &unconnected, &no_spacing).is_some(),
+            refuse("C", (0, 0, 1, 1), &[], &[mk(None)], &unconnected, &[], &no_spacing).is_some(),
             "both unconnected still conflict"
+        );
+    }
+
+    #[test]
+    fn two_cells_flush_against_each_other_are_legal() {
+        // ⚠️ Pads abut. Boxes that only touch do not overlap, so the box test lets this through --
+        // but if the neighbour also carried its metal, the per-layer test would refuse it, because
+        // metal a spacing apart is within spacing. That is why an ordinary fixed cell is filed by
+        // box OR by layer and never both; only a cover cell brings its shapes.
+        let flush = (100, 0, 200, 100);
+        let by_box_only = vec![Blocker {
+            name: "LEFT".into(), bbox: (0, 0, 100, 100), outline: vec![],
+            by_box: true, shapes: vec![],
+        }];
+        assert_eq!(
+            refuse("R", flush, &[], &[shape("metal1", flush)], &by_box_only, &[], &|_| 10),
+            None,
+            "flush against an ordinary cell is legal"
+        );
+        // The same geometry as a cover cell -- shapes, no box -- does refuse it.
+        let by_layer = vec![Blocker {
+            name: "BUMP".into(), bbox: (0, 0, 100, 100), outline: vec![],
+            by_box: false, shapes: vec![shape("metal1", (0, 0, 100, 100))],
+        }];
+        assert!(
+            refuse("R", flush, &[], &[shape("metal1", flush)], &by_layer, &[], &|_| 10).is_some(),
+            "the same geometry as a cover cell is too close"
         );
     }
 

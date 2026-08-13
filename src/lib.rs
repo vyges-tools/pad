@@ -21,12 +21,14 @@
 pub mod bump;
 pub mod clearance;
 pub mod orient;
+pub mod pads;
 pub mod place;
 pub mod ring;
 
 pub use orient::Orient;
 pub use bump::{bumps, is_bump_master, Array, DEFAULT_PREFIX};
-pub use clearance::{intersects, outline_of, refuse, transform, Blocker, Refusal, Shape};
+pub use clearance::{Reason, intersects, outline_of, refuse, transform, Blocker, Refusal, Shape};
+pub use pads::{fits, pad_width, place_one, place_uniform, target_spacing, Pad, Refused, Track};
 pub use place::{
     corner_placement, corner_row_names, mirror_base, oriented_size, overlaps, place_in_row,
     snap_to_site, Edge, Placement, RowGeom,

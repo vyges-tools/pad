@@ -11,10 +11,11 @@
 use std::process::ExitCode;
 use vyges_pad::clearance::Rect;
 use vyges_opendb::Db;
-use vyges_pad::{bumps, corner_placement, corner_row_names, make_rows, mirror_base, oriented_size,
+use vyges_pad::{bumps, corner_placement, intersects, corner_row_names, make_rows, mirror_base, oriented_size,
     outline_of, place_in_row, refuse, snap_to_site, transform, Blocker, Offsets, Orient,
     Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
 use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
+use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
@@ -27,6 +28,7 @@ USAGE:
                                 [--mirror] --inst NAME [options]
   vyges loom pad make-io-bump-array <design.odb> --bump M --origin 'X Y' --rows N
                                    --columns N --pitch 'DX [DY]' [--prefix P] [options]
+  vyges loom pad place-pads <design.odb> --row R --insts 'A B C' [--mode M] [options]
   vyges loom pad remove-io-bump <design.odb> --inst NAME [options]
   vyges loom pad remove-io-bump-array <design.odb> --bump M [options]
   vyges loom pad --describe
@@ -51,6 +53,8 @@ OPTIONS:
   --rows N / --columns N the shape of the array
   --pitch 'DX [DY]'      spacing in MICRONS; one value means both axes
   --prefix P             instance name prefix (default BUMP_)
+  --insts 'A B C'        the pads to spread along a row (place-pads)
+  --mode M               uniform | linear | bump_aligned | placer | default
   --out-odb FILE         write the database here (default: IN PLACE, over the input)
   --out-def FILE         also write the result as DEF (for diffing against a golden)
   --dry-run              report the ring, write nothing
@@ -263,6 +267,14 @@ fn cell_outline(db: &Db, shapes: &[Shape]) -> Vec<Rect> {
 ///
 /// `skip` is the cell being placed — an instance that already exists must not block itself, or
 /// re-running a placement would refuse the position it already holds.
+/// Placement blockages, which forbid a cell outright wherever they reach.
+///
+/// ⚠️ Not the same as a routing obstruction (which [`blockers`] carries): a blockage has no layer,
+/// so there is nothing to compare per layer and nothing an outline can refine.
+fn blockages(db: &Db) -> Vec<(i32, i32, i32, i32)> {
+    db.blockage_boxes().unwrap_or_default()
+}
+
 fn blockers(db: &Db, skip: &str) -> Vec<Blocker> {
     let mut out: Vec<Blocker> = Vec::new();
     for name in db.inst_names() {
@@ -291,7 +303,12 @@ fn blockers(db: &Db, skip: &str) -> Vec<Blocker> {
             // A cover cell sits OVER the die and is judged only by the metal it shares with the
             // cell being placed — never by its bounding box.
             by_box: !is_cover,
-            shapes,
+            // ⚠️ **Either box or metal, never both.** The reference files a fixed instance into one
+            // of two collections: an ordinary cell by box and outline, a cover cell by its shapes
+            // per layer. Carrying both here refuses two ordinary cells placed flush against each
+            // other, because their metal is within a layer's spacing even though their boxes only
+            // touch. That is legal, and common: pads abut.
+            shapes: if is_cover { shapes } else { Vec::new() },
         });
     }
     // Routing obstructions take part in the per-layer check, not the box one.
@@ -387,6 +404,7 @@ fn place_corners(args: &[String]) -> ExitCode {
             &outline,
             &shapes,
             &blockers(&db, &p.name),
+            &blockages(&db),
             &|layer| db.layer_get_spacing(layer),
         ) {
             skipped.push(format!("{} ({why:?})", p.name));
@@ -573,6 +591,162 @@ fn emit_placement_events(what: &str, placed: &[Placement], skipped: &[String]) {
         )
         .with_code("PAD-PLACED"),
     );
+}
+
+/// A placed cell's size on the die, after its orientation.
+fn oriented_size_of(db: &Db, master: &str, orient: Orient) -> (i32, i32) {
+    let (w, h) = master_size(db, master).unwrap_or((0, 0));
+    oriented_size(w, h, orient)
+}
+
+/// **P5** — spread a list of pads along one side of the ring.
+fn place_pads(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let prepared = (|| -> Result<(Track, Vec<Pad>, Option<i32>), String> {
+        let row_name = opts.need("row")?;
+        let row = read_row(&db, row_name).ok_or_else(|| format!("no row `{row_name}`"))?;
+        let edge = row.edge().ok_or_else(|| format!("{row_name} is not a recognized IO row"))?;
+        let site = db.row_get_site(row_name);
+        let track = Track {
+            site_width: db.site_get_width(&site).min(db.site_get_height(&site)),
+            row,
+            edge,
+        };
+
+        let names: Vec<String> =
+            opts.need("insts")?.split_whitespace().map(str::to_string).collect();
+        if names.is_empty() {
+            return Err("place-pads requires a list of instances".into());
+        }
+        let mut pads = Vec::new();
+        for name in names {
+            let master = db.inst_get_master(&name);
+            if master.is_empty() {
+                return Err(format!("no instance named `{name}` in this design"));
+            }
+            let size = master_size(&db, &master)
+                .map_err(|e| format!("cannot measure master `{master}`: {e}"))?;
+            pads.push(Pad { name, master, size });
+        }
+
+        // The strategy. ⚠️ `bump_aligned` is the DEFAULT once any pad connects to a bump, and
+        // degrades to uniform when none do — which is why a case that asks for it by name can
+        // still be a uniform case. Anything that genuinely needs a different placer is refused
+        // rather than quietly placed by this one.
+        let mode = opts.get("mode").unwrap_or("default");
+        let connected = pads.iter().any(|p| connects_to_a_bump(&db, &p.name));
+        let max_spacing = match (mode, connected) {
+            ("uniform", _) | ("default", false) => None,
+            ("linear", _) => Some(0),
+            ("bump_aligned", false) => {
+                eprintln!("vyges-pad: no pad connects to a bump, placing uniformly instead");
+                None
+            }
+            ("default" | "bump_aligned", true) => {
+                return Err("bump-aligned placement is not implemented".into())
+            }
+            ("placer", _) => return Err("the annealing placer is not implemented".into()),
+            (other, _) => return Err(format!("`{other}` is not a placement mode")),
+        };
+
+        if let Err((total, room)) = fits(&track, &pads) {
+            return Err(format!(
+                "the pads total {total} units and {} has room for {room}",
+                track.row.name
+            ));
+        }
+        Ok((track, pads, max_spacing))
+    })();
+
+    let (track, pads, max_spacing) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // ⚠️ Everything already in the way, once -- **and each pad joins the list as it lands**. A pad
+    // that had to slide is an obstruction to the pads after it, so leaving this out places the
+    // first shifted pad correctly and then walks the rest straight through it.
+    let mut start = blockers(&db, "");
+    start.retain(|b| intersects(b.bbox, track.row.bbox) || !b.by_box);
+    let fixed = std::cell::RefCell::new(start);
+    let stops = blockages(&db);
+    let shapes_at = |name: &str, bbox: (i32, i32, i32, i32), orient: Orient| {
+        let master = db.inst_get_master(name);
+        let shapes = cell_shapes(&db, &master, orient, (bbox.0, bbox.1));
+        let outline = cell_outline(&db, &shapes);
+        (shapes, outline)
+    };
+    let mut conflict = |name: &str, bbox: (i32, i32, i32, i32), orient: Orient| {
+        let (shapes, outline) = shapes_at(name, bbox, orient);
+        refuse(name, bbox, &outline, &shapes, &fixed.borrow(), &stops, &|l| {
+            db.layer_get_spacing(l)
+        })
+    };
+    let mut settle = |p: &Placement| {
+        let (dx, dy) = oriented_size_of(&db, &p.master, p.orient);
+        let bbox = (p.x, p.y, p.x + dx, p.y + dy);
+        let (_, outline) = shapes_at(&p.name, bbox, p.orient);
+        // A pad is not a cover cell: it blocks by box and outline only. See `blockers`.
+        fixed.borrow_mut().push(Blocker {
+            name: p.name.clone(),
+            bbox,
+            outline,
+            by_box: true,
+            shapes: Vec::new(),
+        });
+    };
+    let result = place_uniform(&track, &pads, max_spacing, &mut conflict, &mut settle);
+
+    let placed = match result {
+        Ok(v) => v,
+        Err(Refused::OutOfRow { name, at }) => {
+            eprintln!("vyges-pad: {name} at {at:?} does not fit inside {}", track.row.name);
+            return ExitCode::from(2);
+        }
+        Err(Refused::Blocked { name, why }) => {
+            eprintln!("vyges-pad: cannot place {name}: {:?}", why.reason);
+            return ExitCode::from(2);
+        }
+    };
+
+    if !opts.dry_run {
+        for p in &placed {
+            if let Err(e) = commit(&mut db, p, false) {
+                eprintln!("vyges-pad: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    finish(&opts, &mut db, "pads", &placed, &[])
+}
+
+/// Does this pad share a non-supply net with a bump?
+///
+/// ⚠️ Supply nets do not count: a pad and a bump on `VDD` are expected to meet through the power
+/// grid, and treating that as an alignment request would align the whole ring to the power bumps.
+fn connects_to_a_bump(db: &Db, inst: &str) -> bool {
+    for pin in db.inst_get_i_terms(inst) {
+        let net = db.iterm_get_net(inst, &pin);
+        if net.is_empty() || matches!(db.net_get_sig_type(&net).as_str(), "POWER" | "GROUND") {
+            continue;
+        }
+        for term in db.net_get_i_terms(&net) {
+            // ⚠️ Split on the LAST slash: an iterm reads `<instance>/<pin>` and an instance name
+            // can itself be hierarchical.
+            let Some((owner, _)) = term.rsplit_once('/') else { continue };
+            if db.master_is_cover(&db.inst_get_master(owner)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// **U1** — a grid of bumps over the die.
@@ -895,6 +1069,7 @@ fn main() -> ExitCode {
         Some("make-io-sites") => make_io_sites(&args[1..]),
         Some("place-corners") => place_corners(&args[1..]),
         Some("place-pad") => place_pad(&args[1..]),
+        Some("place-pads") => place_pads(&args[1..]),
         Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),
