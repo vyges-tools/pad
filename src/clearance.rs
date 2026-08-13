@@ -57,6 +57,14 @@ pub enum Reason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub reason: Reason,
+    /// The blocker's **own** rectangle, not the part of it the cell touches.
+    ///
+    /// ⚠️ The two are different questions and the reference asks both. "Where do I collide?" wants
+    /// the intersection; "how far must I move to get clear?" wants the whole obstruction. Answering
+    /// the second with the first bounds every escape by the cell's own width, so a cell can never
+    /// step past anything wider than itself — and the symptom is a placer that shuffles instead of
+    /// jumping.
+    pub blocker: Rect,
     /// ⚠️ The **intersection** with the cell's box, not the blocker's own box. Callers that shift
     /// a cell along a row snap to where the overlap *starts*; the blocker's box can begin far
     /// behind the cell, which would shift it backwards rather than clear of the obstacle.
@@ -136,7 +144,11 @@ pub fn refuse(
     // told about, so checking instances before blockages would shift to a different site.
     for &g in blockages {
         if intersects(cell_bbox, g) {
-            return Some(Refusal { reason: Reason::Blockage, overlap: overlap_of(cell_bbox, g) });
+            return Some(Refusal {
+                reason: Reason::Blockage,
+                blocker: g,
+                overlap: overlap_of(cell_bbox, g),
+            });
         }
     }
 
@@ -157,6 +169,7 @@ pub fn refuse(
         if refined {
             return Some(Refusal {
                 reason: Reason::Instance(b.name.clone()),
+                blocker: b.bbox,
                 overlap: overlap_of(cell_bbox, b.bbox),
             });
         }
@@ -177,6 +190,7 @@ pub fn refuse(
                     s.net.is_some() && other.net.is_some() && s.net == other.net;
                 if !nets_match && intersects(grown, other.rect) {
                     return Some(Refusal {
+                        blocker: other.rect,
                         // ⚠️ The overlap is measured against the cell's BOX, not its grown shape:
                         // the shape may reach outside the cell, and a shift target taken from
                         // there would move the cell further than the conflict requires.

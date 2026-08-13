@@ -297,6 +297,7 @@ mod tests {
             (b.0 < block.2 && block.0 < b.2)
                 .then(|| Refusal {
                     reason: crate::clearance::Reason::Blockage,
+                    blocker: block,
                     overlap: (b.0.max(block.0), 0, b.2.min(block.2), 60),
                 })
         };
@@ -315,6 +316,7 @@ mod tests {
             (b.0 < block.2 && block.0 < b.2)
                 .then(|| Refusal {
                     reason: crate::clearance::Reason::Blockage,
+                    blocker: block,
                     overlap: (b.0.max(block.0), 0, b.2.min(block.2), 60),
                 })
         };

@@ -326,6 +326,7 @@ pub fn spread_pass(
     site: i32,
     snap: &dyn Fn(i32) -> i32,
     blocked: &dyn Fn(usize, i32) -> Option<(i32, i32)>,
+    watch: &mut dyn FnMut(usize, i32, i32, i32, i32),
 ) -> bool {
     let mut violations = false;
     // Pads that tried to jump an obstruction and could not, with where they wanted to be.
@@ -376,6 +377,7 @@ pub fn spread_pass(
 
         let want = snap(curr.centre + move_by - half) + half;
         anchors[i].set_location(want.clamp(prev_pos, next_pos) - half);
+        watch(i, curr.centre, anchors[i].centre, prev_pos, next_pos);
     }
 
     // **SP10** — a pad that could not jump pushes the pads in its way.
@@ -472,7 +474,7 @@ mod tests {
     fn a_pass_separates_two_overlapping_pads() {
         let mut a = anchors(&[(1000, 1000), (1500, 1000)]);
         let targets = [1500, 2000];
-        let had = spread_pass(&mut a, &targets, (0, 10_000), 0.1, 0.5, 0.2, 100, &|p| p, &|_, _| None);
+        let had = spread_pass(&mut a, &targets, (0, 10_000), 0.1, 0.5, 0.2, 100, &|p| p, &|_, _| None, &mut |_, _, _, _, _| {});
         assert!(had, "the pass reports the overlap it found");
         assert!(a[1].min >= a[0].min, "and the order is preserved");
     }
@@ -481,7 +483,7 @@ mod tests {
     fn a_settled_row_reports_no_violation() {
         let mut a = anchors(&[(0, 1000), (2000, 1000), (4000, 1000)]);
         let targets = [500, 2500, 4500];
-        assert!(!spread_pass(&mut a, &targets, (0, 10_000), 0.0, 0.5, 0.2, 100, &|p| p, &|_, _| None));
+        assert!(!spread_pass(&mut a, &targets, (0, 10_000), 0.0, 0.5, 0.2, 100, &|p| p, &|_, _| None, &mut |_, _, _, _, _| {}));
     }
 
     #[test]
@@ -489,7 +491,7 @@ mod tests {
         // ⚠️ The middle pad cannot pass either neighbour however hard the spring pulls.
         let mut a = anchors(&[(0, 100), (1000, 100), (2000, 100)]);
         let targets = [50, 900_000, 2050];
-        spread_pass(&mut a, &targets, (0, 10_000), 1.0, 0.5, 1.0, 10, &|p| p, &|_, _| None);
+        spread_pass(&mut a, &targets, (0, 10_000), 1.0, 0.5, 1.0, 10, &|p| p, &|_, _| None, &mut |_, _, _, _, _| {});
         assert!(a[1].centre <= a[2].centre, "never past the pad ahead");
         assert!(a[1].centre >= a[0].centre, "nor behind the one before");
     }

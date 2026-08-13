@@ -1940,10 +1940,33 @@ fn place_force_directed(
         .zip(aligned)
         .map(|(&pos, a)| Anchor::at(snap(pos - a.width / 2), a.width))
         .collect();
+    // ⚠️ A trace in the reference's own shape, so the two can be diffed line for line rather than
+    // reasoned about. This is the facility that closed the RDL attempt-order question.
+    let watched = std::env::var("VYGES_PAD_TRACE").ok();
+    let mut iterations = 0;
     for k in 0..MAX_ITERATIONS {
         let (spring, repel) = forces(k);
-        if !spread_pass(&mut anchors, &ordered, row, spring, repel, DAMPER, site, &snap, &blocked) {
+        let names = &pads;
+        let w = watched.clone();
+        let mut watch = |i: usize, from: i32, to: i32, lo: i32, hi: i32| {
+            if let Some(name) = &w {
+                if names[i].name == *name && from != to {
+                    eprintln!("{k} / {name}: {from} -> {to} ({lo}, {from}, {hi})");
+                }
+            }
+        };
+        let more = spread_pass(
+            &mut anchors, &ordered, row, spring, repel, DAMPER, site, &snap, &blocked, &mut watch,
+        );
+        iterations = k + 1;
+        if !more {
             break;
+        }
+    }
+    if let Some(name) = &watched {
+        if let Some(i) = pads.iter().position(|p| p.name == *name) {
+            eprintln!("final / {name}: centre {} after {iterations} iterations", anchors[i].centre);
+            eprintln!("target / {name}: pooled {} (ideal {})", ordered[i], targets[i]);
         }
     }
 
@@ -2130,7 +2153,9 @@ fn place_pads(args: &[String]) -> ExitCode {
                 refuse(name, bbox, &outline, &shapes, &fixed.borrow(), &stops, &|l| {
                     db.layer_get_spacing(l)
                 })
-                .map(|r| r.overlap)
+                // ⚠️ The blocker's own rectangle. See `Refusal::blocker`: the intersection would
+                // bound every jump by the pad's own width.
+                .map(|r| r.blocker)
             };
             place_force_directed(&track, &pads, &aligned, &mut conflict, &probe, &mut settle)
         }
