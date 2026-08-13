@@ -9,10 +9,11 @@
 //! Exit status: 0 rows created, 1 the design cannot carry a ring, 2 usage/read/write error.
 
 use std::process::ExitCode;
+use vyges_pad::clearance::Rect;
 use vyges_opendb::Db;
 use vyges_pad::{corner_placement, corner_row_names, make_rows, mirror_base, oriented_size,
-    overlaps, place_in_row, snap_to_site, Offsets, Orient, Placement, Row, RowDir, RowGeom,
-    Rotations, Site};
+    outline_of, place_in_row, refuse, snap_to_site, transform, Blocker, Offsets, Orient,
+    Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
@@ -60,12 +61,14 @@ const DESCRIBE: &str = r#"{
   "maturity": "partial",
   "provenance_limitations": [
       "input_hash covers the argument vector, not the content of the .odb it names.",
-      "SCOPE: this build implements the IO RING only -- `make-io-sites`. Pad, corner, filler, bond-pad and terminal placement, the bump array, and connection by abutment are not implemented. The ring is the foundation the rest place into, which is why it is first.",
+      "SCOPE: this build implements the IO RING (`make-io-sites`), single-pad placement (`place-pad`) and corner placement (`place-corners`). Filler, bond-pad and terminal placement, the bump array, distributed pad placement and connection by abutment are not implemented.",
+      "A cell is refused a position by a LAYER-AWARE check, not a bounding-box one: a fixed instance blocks by box refined by its OVERLAP-layer outline where either side declares one, and anything sharing a layer blocks when the moving cell's shapes, grown by that layer's spacing, reach it. A COVER master (a bump) never blocks by box -- only by shared metal.",
+      "SIMPLIFICATION: shape nets are not carried, so two shapes on the same net are treated as a conflict. The reference lets them touch. A cell being created has no nets, which is why every supported case is unaffected; a command placing already-connected cells would need them.",
       "The upstream module also contains a redistribution-layer ROUTER. That is a routing engine and is deliberately out of scope for this one; it is not merely unimplemented, it belongs elsewhere.",
       "The ring is the die area inset by the offset, corners sized from the corner site, and four edges truncated to WHOLE sites -- a remainder that does not fill a site is given up rather than rounded out.",
       "A corner's WIDTH is the larger of the corner site's width and the horizontal row's depth, so the row abutting it can be what sets the corner size.",
       "The left and right rows are laid on their side when the horizontal and vertical sites are THE SAME SITE, and upright when they differ. The reference compares the site objects; this command compares the names it was given, which is the same thing for a name that resolves to one site.",
-      "MEASURED: the ring reproduces the reference row output exactly -- name, site, origin, orientation, direction, site count and pitch -- on all three of its ring cases, including the rotated one and the one giving the two directions different sites.",
+      "MEASURED: the ring reproduces the reference row output exactly -- name, site, origin, orientation, direction, site count and pitch -- on all 26 cases that build one, including three real sky130 designs. Pad and corner placement match on all 6 comparable cases.",
       "Written against the upstream pad sources at pin b5624809f29048e1f9ce9e83eb562620c652e084. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
@@ -195,6 +198,39 @@ fn read_row(db: &Db, name: &str) -> Option<RowGeom> {
     })
 }
 
+/// A master's shapes, moved to where a cell placed at `at` with this orientation would put them.
+///
+/// Obstructions and pin shapes together — the per-layer clearance check does not distinguish them,
+/// and a cell's metal is its metal whichever collection it came from.
+///
+/// ℹ️ Nets are not carried. The reference lets two shapes on the SAME net touch; a corner being
+/// created has no nets at all, so every shared-layer overlap is a conflict for it either way. A
+/// command that places cells already connected to nets would need them.
+fn cell_shapes(db: &Db, master: &str, orient: Orient, at: (i32, i32)) -> Vec<Shape> {
+    let (mw, mh) = match master_size(db, master) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for src in [db.master_obstruction_boxes(master), db.master_pin_boxes(master)] {
+        for (layer, x0, y0, x1, y1) in src.unwrap_or_default() {
+            out.push(Shape {
+                layer: db.layer_name_by_number(layer),
+                rect: transform((x0, y0, x1, y1), (mw, mh), orient, at),
+                net: None,
+            });
+        }
+    }
+    out
+}
+
+/// The OVERLAP-layer part of a cell's shapes — its true outline, where it declares one.
+fn cell_outline(db: &Db, shapes: &[Shape]) -> Vec<Rect> {
+    outline_of(shapes, &|layer| {
+        db.layer_get_type(layer).unwrap_or_default() == "OVERLAP"
+    })
+}
+
 /// Everything a cell must not land on.
 ///
 /// Two filters, and both matter — without them a correct placement is refused:
@@ -212,8 +248,8 @@ fn read_row(db: &Db, name: &str) -> Option<RowGeom> {
 ///
 /// `skip` is the cell being placed — an instance that already exists must not block itself, or
 /// re-running a placement would refuse the position it already holds.
-fn blockers(db: &Db, skip: &str) -> Vec<(i32, i32, i32, i32)> {
-    let mut out: Vec<(i32, i32, i32, i32)> = Vec::new();
+fn blockers(db: &Db, skip: &str) -> Vec<Blocker> {
+    let mut out: Vec<Blocker> = Vec::new();
     for name in db.inst_names() {
         if name == skip {
             continue;
@@ -221,18 +257,41 @@ fn blockers(db: &Db, skip: &str) -> Vec<(i32, i32, i32, i32)> {
         if !matches!(db.inst_get_placement_status(&name).as_str(), "FIRM" | "LOCKED" | "COVER") {
             continue;
         }
+        let Ok(b) = db.inst_bbox(&name) else { continue };
+        let [x0, y0, x1, y1] = b[..] else { continue };
+
+        let master = db.inst_get_master(&name);
         // ⚠️ **Prefix, not equality.** odb reports a master's class as the LEF spells it, and
         // `CLASS COVER BUMP` comes back as `"COVER BUMP"`. An equality test against `"COVER"`
         // matches nothing, blocks every bump, and fails silently — the same trap `tap` hit with
         // LEF58 endcap types.
-        if db.master_get_type(&db.inst_get_master(&name)).unwrap_or_default().starts_with("COVER") {
-            continue;
-        }
-        if let Ok(b) = db.inst_bbox(&name) {
-            if let [x0, y0, x1, y1] = b[..] {
-                out.push((x0, y0, x1, y1));
-            }
-        }
+        let is_cover =
+            db.master_get_type(&master).unwrap_or_default().starts_with("COVER");
+        let orient = Orient::parse(&db.inst_get_orient(&name)).unwrap_or(Orient::R0);
+        let shapes = cell_shapes(db, &master, orient, (x0, y0));
+        out.push(Blocker {
+            name,
+            bbox: (x0, y0, x1, y1),
+            outline: cell_outline(db, &shapes),
+            // A cover cell sits OVER the die and is judged only by the metal it shares with the
+            // cell being placed — never by its bounding box.
+            by_box: !is_cover,
+            shapes,
+        });
+    }
+    // Routing obstructions take part in the per-layer check, not the box one.
+    for (layer, x0, y0, x1, y1) in db.obstruction_boxes().unwrap_or_default() {
+        out.push(Blocker {
+            name: format!("obstruction@{layer}"),
+            bbox: (x0, y0, x1, y1),
+            outline: vec![],
+            by_box: false,
+            shapes: vec![Shape {
+                layer: db.layer_name_by_number(layer),
+                rect: (x0, y0, x1, y1),
+                net: None,
+            }],
+        });
     }
     out
 }
@@ -303,9 +362,19 @@ fn place_corners(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         };
         let p = corner_placement(&row, &master);
-        let oriented = oriented_size(size.0, size.1, p.orient);
-        if overlaps((p.x, p.y), oriented, &blockers(&db, &p.name)) {
-            skipped.push(p.name.clone());
+        let (dx, dy) = oriented_size(size.0, size.1, p.orient);
+        let bbox = (p.x, p.y, p.x + dx, p.y + dy);
+        let shapes = cell_shapes(&db, &master, p.orient, (p.x, p.y));
+        let outline = cell_outline(&db, &shapes);
+        if let Some(why) = refuse(
+            &p.name,
+            bbox,
+            &outline,
+            &shapes,
+            &blockers(&db, &p.name),
+            &|layer| db.layer_get_spacing(layer),
+        ) {
+            skipped.push(format!("{} ({why:?})", p.name));
             continue;
         }
         if !opts.dry_run {
@@ -475,7 +544,7 @@ fn emit_placement_events(what: &str, placed: &[Placement], skipped: &[String]) {
             &Event::new(
                 "vyges-pad",
                 Severity::Warn,
-                format!("skipping {s}: it would overlap something already placed"),
+                format!("skipping {s}"),
             )
             .with_code("PAD-SKIP-OVERLAP")
             .with_objects(vec![format!("inst:{s}")]),
