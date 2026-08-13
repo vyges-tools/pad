@@ -1235,6 +1235,17 @@ fn rdl_route(args: &[String]) -> ExitCode {
         }
     }
 
+    if let Some(path) = opts.get("attempt-report") {
+        let body: String = done
+            .log
+            .iter()
+            .map(|(s, t, n)| format!("{} {} {} {} {n}\n", s.0, s.1, t.0, t.1))
+            .collect();
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
     let made: Vec<String> =
         done.paths.iter().map(|(n, s, d, _)| format!("{n}: {s} -> {d}")).collect();
     eprintln!(

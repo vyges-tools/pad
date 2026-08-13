@@ -780,6 +780,9 @@ pub fn commit_corridor(route: &[Point], width: i32, spacing: i32) -> Vec<Rect> {
 pub struct Routed {
     /// `(net, source terminal, destination terminal, path)` for every route that connected.
     pub paths: Vec<(String, String, String, Vec<Point>)>,
+    /// Every attempt in order: `(source centre, destination centre, path length)`. A length of
+    /// zero is an attempt that found nothing.
+    pub log: Vec<(Point, Point, usize)>,
     pub attempts: usize,
     pub iterations: i32,
     pub failed: Vec<String>,
@@ -838,8 +841,34 @@ pub fn route_all(
             if !routes[i].has_next() {
                 continue;
             }
-            let d = routes[i].dests[routes[i].next].clone();
-            routes[i].next += 1;
+            // **L9** — skip destinations that are already served.
+            //
+            // ⚠️ A **pad** already reached by another route is skipped: a pad needs one connection,
+            // and routing to it twice wastes the attempt and blocks the corridor for whoever still
+            // needs it. So is the reverse of a pair already routed — that wire exists, drawn from
+            // the other end. Bumps are *not* skipped this way: several may share a net.
+            let d = loop {
+                if !routes[i].has_next() {
+                    break None;
+                }
+                let cand = routes[i].dests[routes[i].next].clone();
+                routes[i].next += 1;
+                let served = !cand.cover
+                    && routes.iter().any(|r| {
+                        r.routed && r.points.len() > 1 && r.dests.get(r.next.saturating_sub(1))
+                            .is_some_and(|x| x.terminal == cand.terminal)
+                    });
+                let reversed = routes.iter().any(|r| {
+                    r.routed
+                        && r.source == cand.terminal
+                        && r.dests.get(r.next.saturating_sub(1))
+                            .is_some_and(|x| x.terminal == routes[i].source)
+                });
+                if !served && !reversed {
+                    break Some(cand);
+                }
+            };
+            let Some(d) = d else { continue };
 
             let (Some(src), Some(dst)) = (access.get(&routes[i].source), access.get(&d.terminal))
             else {
@@ -862,6 +891,7 @@ pub fn route_all(
             let path = shortest_path(graph, src.0, dst.0, turn_penalty);
             graph.undo(&b);
             graph.undo(&a);
+            out.log.push((src.0, dst.0, path.len()));
 
             if path.is_empty() {
                 if routes[i].has_next() {
