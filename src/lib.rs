@@ -18,6 +18,7 @@
 //!
 //! Nothing in this module reads a database; the binary does that and hands values in.
 
+pub mod abut;
 pub mod bump;
 pub mod clearance;
 pub mod orient;
@@ -26,6 +27,7 @@ pub mod place;
 pub mod ring;
 
 pub use orient::Orient;
+pub use abut::{all_touching, connect_by_abutment, touches, touching_terms, Conflict, PadInst, Plan, Terminal};
 pub use bump::{bumps, is_bump_master, Array, DEFAULT_PREFIX};
 pub use clearance::{Reason, intersects, outline_of, refuse, transform, Blocker, Refusal, Shape};
 pub use pads::{fits, pad_width, place_one, place_uniform, target_spacing, Pad, Refused, Track};

@@ -16,6 +16,7 @@ use vyges_pad::{bumps, corner_placement, intersects, corner_row_names, make_rows
     Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
 use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
 use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
+use vyges_pad::abut::{connect_by_abutment, special_sig_type, PadInst, Terminal};
 
 const USAGE: &str = "\
 vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
@@ -29,6 +30,7 @@ USAGE:
   vyges loom pad make-io-bump-array <design.odb> --bump M --origin 'X Y' --rows N
                                    --columns N --pitch 'DX [DY]' [--prefix P] [options]
   vyges loom pad place-pads <design.odb> --row R --insts 'A B C' [--mode M] [options]
+  vyges loom pad connect-by-abutment <design.odb> [options]
   vyges loom pad remove-io-bump <design.odb> --inst NAME [options]
   vyges loom pad remove-io-bump-array <design.odb> --bump M [options]
   vyges loom pad --describe
@@ -546,6 +548,51 @@ fn finish(
     }
 }
 
+/// Write out and report a command whose result is connections rather than placements.
+fn finish_report(
+    opts: &Opts,
+    db: &mut Db,
+    what: &str,
+    made: &[String],
+    removed: &[String],
+) -> ExitCode {
+    if !opts.dry_run {
+        let out_odb = opts.get("out-odb").unwrap_or(&opts.odb).to_string();
+        if let Err(e) = db.write(&out_odb) {
+            eprintln!("vyges-pad: cannot write {out_odb}: {e}");
+            return ExitCode::from(2);
+        }
+        if let Some(path) = opts.get("out-def") {
+            if let Err(e) = db.write_def(path) {
+                eprintln!("vyges-pad: cannot write {path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let quoted = |v: &[String]| {
+        v.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")
+    };
+    let report = format!(
+        "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"{what}\",\n  \"status\": \"ok\",\n  \
+         \"connections\": {},\n  \"removed\": [{}],\n  \"made\": [{}]\n}}",
+        made.len(),
+        quoted(removed),
+        quoted(made),
+    );
+    match opts.get("o") {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, format!("{report}\n")) {
+                eprintln!("vyges-pad: cannot write {path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => println!("{report}"),
+    }
+    // ⚠️ Zero connections is a legitimate answer here -- a ring with nothing touching is unusual,
+    // not wrong -- so this does not take the empty-result exit code the placement path uses.
+    ExitCode::SUCCESS
+}
+
 fn placement_json(what: &str, placed: &[Placement], skipped: &[String]) -> String {
     let list = placed
         .iter()
@@ -597,6 +644,158 @@ fn emit_placement_events(what: &str, placed: &[Placement], skipped: &[String]) {
 fn oriented_size_of(db: &Db, master: &str, orient: Orient) -> (i32, i32) {
     let (w, h) = master_size(db, master).unwrap_or((0, 0));
     oriented_size(w, h, orient)
+}
+
+/// Every pad instance, gathered row by row exactly as the reference gathers them.
+///
+/// Fixed, not a cover cell, and overlapping a row. ⚠️ **All** rows, core rows included — that is
+/// what the reference iterates, and narrowing it to the IO rows would be a different census.
+fn pad_insts(db: &Db) -> Vec<PadInst> {
+    let names = db.inst_names();
+    let mut out = Vec::new();
+    // ⚠️ **Row by row, not instance by instance.** The two visit the same set and produce a
+    // different ORDER, and order decides which terminal names a net created by abutment. Doing a
+    // single pass over instances gets identical connectivity and the wrong net names.
+    for row in db.row_names().unwrap_or_default() {
+        let r = (
+            db.row_get_b_box_x_min(&row),
+            db.row_get_b_box_y_min(&row),
+            db.row_get_b_box_x_max(&row),
+            db.row_get_b_box_y_max(&row),
+        );
+        for name in &names {
+            if !matches!(db.inst_get_placement_status(name).as_str(), "FIRM" | "LOCKED" | "COVER")
+            {
+                continue;
+            }
+            let master = db.inst_get_master(name);
+            if db.master_is_cover(&master) {
+                continue;
+            }
+            let Ok(b) = db.inst_bbox(name) else { continue };
+            let [x0, y0, x1, y1] = b[..] else { continue };
+            let bbox = (x0, y0, x1, y1);
+            // ⚠️ `intersects` here is the strict test: a cell merely grazing a row's edge is not
+            // in that row. This is the clearance predicate, not the abutment one.
+            if !intersects(bbox, r) {
+                continue;
+            }
+
+            let Ok((mw, mh)) = master_size(db, &master) else { continue };
+            let orient = Orient::parse(&db.inst_get_orient(name)).unwrap_or(Orient::R0);
+            let terms = db
+                .master_get_m_terms(&master)
+                .into_iter()
+                .map(|term| {
+                    let shapes = db
+                        .mterm_pin_boxes(&master, &term)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(layer, a, b, c, d)| {
+                            (layer, transform((a, b, c, d), (mw, mh), orient, (x0, y0)))
+                        })
+                        .collect();
+                    let net = db.iterm_get_net(name, &term);
+                    Terminal {
+                        supply: matches!(
+                            db.iterm_get_sig_type(name, &term).as_str(),
+                            "POWER" | "GROUND"
+                        ),
+                        name: term,
+                        shapes,
+                        net: (!net.is_empty()).then_some(net),
+                    }
+                })
+                .collect();
+            // ⚠️ A cell reaching into two rows is collected TWICE, deliberately: the reference
+            // does the same, and deduplicating would change the order everything below depends on.
+            out.push(PadInst { name: name.clone(), bbox, terms });
+        }
+    }
+    out
+}
+
+/// **A6** — mark a net special, and settle its signal type.
+fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
+    let iterms: Vec<(String, String)> = db
+        .net_get_i_terms(net)
+        .iter()
+        .filter_map(|t| t.rsplit_once('/').map(|(i, p)| (i.to_string(), p.to_string())))
+        .collect();
+    let types: Vec<(bool, String)> = iterms
+        .iter()
+        .map(|(i, p)| {
+            let ty = db.iterm_get_sig_type(i, p);
+            (matches!(ty.as_str(), "POWER" | "GROUND"), ty)
+        })
+        .collect();
+    let sig = special_sig_type(&db.net_get_sig_type(net), &types);
+
+    db.net_set_special(net).map_err(|e| format!("cannot mark {net} special: {e}"))?;
+    for (i, p) in &iterms {
+        db.iterm_set_special(i, p).map_err(|e| format!("cannot mark {i}/{p} special: {e}"))?;
+    }
+    for bterm in db.net_get_b_terms(net) {
+        db.bterm_set_special(&bterm).map_err(|e| format!("cannot mark {bterm} special: {e}"))?;
+        db.bterm_set_sig_type(&bterm, &sig).map_err(|e| format!("cannot type {bterm}: {e}"))?;
+    }
+    db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
+}
+
+/// **A4** — wire the ring by abutment.
+fn connect_ring(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let insts = pad_insts(&db);
+    let plan = match connect_by_abutment(&insts, &|n| db.net_get_i_term_count(n) + db.net_get_b_term_count(n)) {
+        Ok(p) => p,
+        Err(c) => {
+            eprintln!(
+                "vyges-pad: {}/{} ({}) and {}/{} ({}) are touching but on different nets",
+                insts[c.a.0].name,
+                insts[c.a.0].terms[c.a.1].name,
+                c.net_a,
+                insts[c.b.0].name,
+                insts[c.b.0].terms[c.b.1].name,
+                c.net_b
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    if !opts.dry_run {
+        let apply = (|| -> Result<(), String> {
+            for net in &plan.destroy {
+                db.destroy_net(net).map_err(|e| format!("cannot remove {net}: {e}"))?;
+            }
+            for net in &plan.create {
+                db.create_net(net).map_err(|e| format!("cannot create {net}: {e}"))?;
+            }
+            for ((i, t), net) in &plan.connect {
+                let (inst, term) = (&insts[*i].name, &insts[*i].terms[*t].name);
+                db.connect(inst, term, net)
+                    .map_err(|e| format!("cannot connect {inst}/{term} to {net}: {e}"))?;
+            }
+            for net in &plan.special {
+                make_special(&mut db, net)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = apply {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let touched: Vec<String> = plan
+        .connect
+        .iter()
+        .map(|((i, t), net)| format!("{}/{} -> {net}", insts[*i].name, insts[*i].terms[*t].name))
+        .collect();
+    finish_report(&opts, &mut db, "abutment", &touched, &plan.destroy)
 }
 
 /// **P5** — spread a list of pads along one side of the ring.
@@ -1070,6 +1269,7 @@ fn main() -> ExitCode {
         Some("place-corners") => place_corners(&args[1..]),
         Some("place-pad") => place_pad(&args[1..]),
         Some("place-pads") => place_pads(&args[1..]),
+        Some("connect-by-abutment") => connect_ring(&args[1..]),
         Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),
