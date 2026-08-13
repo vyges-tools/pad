@@ -1924,7 +1924,7 @@ fn place_force_directed(
         vyges_pad::spread::nearest_legal(pos, blocked(i, pos), half, row)
     };
     for _ in 0..ordered.len() {
-        if !vyges_pad::spread::pool_round(&mut ordered, &mut weights, &legalise) {
+        if !vyges_pad::spread::pool_round(&mut ordered, &mut weights, row, &legalise) {
             break;
         }
     }

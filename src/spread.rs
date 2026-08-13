@@ -78,11 +78,20 @@ pub fn pool_adjacent_violators(positions: &mut [i32], weights: &mut [f32]) -> bo
 pub fn pool_round(
     positions: &mut [i32],
     weights: &mut [f32],
+    row: (i32, i32),
     legal: &dyn Fn(usize, i32) -> i32,
 ) -> bool {
     let mut updated = pool_pass(positions, weights);
     for i in 0..positions.len() {
         let fixed = legal(i, positions[i]);
+        // ⚠️ A legalisation that leaves the row is not a position. An obstruction reaching past
+        // both ends makes "step to the far side" land outside the die, and this value becomes the
+        // spring target for every later iteration — a pad pulled at full force towards somewhere
+        // it can never be. Keeping the original is wrong too, but it is *bounded*, and the spread
+        // can still resolve it.
+        if fixed < row.0 || fixed > row.1 {
+            continue;
+        }
         if fixed != positions[i] {
             positions[i] = fixed;
             updated = true;
@@ -357,7 +366,8 @@ pub fn spread_pass(
         // past an obstruction that lies within reach of its neighbours.
         let mut move_by = move_by;
         if move_by != 0 {
-            let check = (curr.centre + move_by).clamp(prev_pos, next_pos);
+            // Same nesting as below, and for the same reason: the bounds can invert.
+            let check = prev_pos.max(next_pos.min(curr.centre + move_by));
             let probe = |c: i32| blocked(i, c);
             let t = tunnel_position(
                 check,
@@ -375,8 +385,12 @@ pub fn spread_pass(
             }
         }
 
+        // ⚠️ `max(prev, min(next, x))`, **not** `clamp`. On a congested row a pass can leave a
+        // pad's predecessor ahead of its successor, and `clamp` panics when its bounds are
+        // inverted. The reference's nesting yields `prev` in that case and carries on — the
+        // difference is a crash on a real design versus a placement that keeps going.
         let want = snap(curr.centre + move_by - half) + half;
-        anchors[i].set_location(want.clamp(prev_pos, next_pos) - half);
+        anchors[i].set_location(prev_pos.max(next_pos.min(want)) - half);
         watch(i, curr.centre, anchors[i].centre, prev_pos, next_pos);
     }
 
@@ -468,6 +482,16 @@ mod tests {
         assert!(step_move(0, 0.0, 500, 0, 0.5, 0.2, 1000) > 0);
         // The pad after overlaps: the push is backward.
         assert!(step_move(0, 0.0, 0, 500, 0.5, 0.2, 1000) < 0);
+    }
+
+    #[test]
+    fn inverted_neighbour_bounds_do_not_panic() {
+        // ⚠️ A congested row can leave a pad's predecessor ahead of its successor. `clamp` panics
+        // on inverted bounds; the reference's nesting yields the lower bound and carries on.
+        let mut a = anchors(&[(5000, 100), (0, 100), (0, 100)]);
+        let targets = [0, 0, 0];
+        spread_pass(&mut a, &targets, (0, 10_000), 0.1, 0.5, 0.2, 100, &|p| p, &|_, _| None,
+                    &mut |_, _, _, _, _| {});
     }
 
     #[test]
