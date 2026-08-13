@@ -16,6 +16,7 @@ use vyges_pad::{bumps, corner_placement, intersects, corner_row_names, make_rows
     Placement, Row, RowDir, RowGeom, Rotations, Shape, Site};
 use vyges_pad::bump::{is_bump_master, Array, DEFAULT_PREFIX};
 use vyges_pad::pads::{fits, place_uniform, Pad, Refused, Track};
+use vyges_pad::fill::{fill_row, Filler, Unfilled};
 use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, PadInst, Terminal};
 use vyges_pad::bond::{bond_shape, is_bond_master, matching, pin_shape, place as bond_place};
 
@@ -31,6 +32,10 @@ USAGE:
   vyges loom pad make-io-bump-array <design.odb> --bump M --origin 'X Y' --rows N
                                    --columns N --pitch 'DX [DY]' [--prefix P] [options]
   vyges loom pad place-pads <design.odb> --row R --insts 'A B C' [--mode M] [options]
+  vyges loom pad place-io-fill <design.odb> --row R --masters 'A B C'
+                              [--permit-overlaps 'M'] [options]
+  vyges loom pad place-io-terminals <design.odb> --pins 'PATTERN...'
+                                   [--allow-non-top-layer] [options]
   vyges loom pad connect-by-abutment <design.odb> [options]
   vyges loom pad place-bondpad <design.odb> --bond M --insts 'PATTERN...'
                                [--offset 'X Y'] [--rotation R] [--prefix P] [options]
@@ -149,6 +154,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--json" => {}
             "--dry-run" => o.dry_run = true,
             "--mirror" => o.mirror = true,
+            // ⚠️ Flags must be listed here. Anything else beginning with `--` is read as taking a
+            // value, so an unlisted flag silently swallows the argument after it.
+            "--allow-non-top-layer" => o.keys.push(("allow-non-top-layer".into(), "1".into())),
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -573,7 +581,7 @@ fn finish_report(
         }
     }
     let quoted = |v: &[String]| {
-        v.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")
+        v.iter().map(|s| format!("\"{}\"", escape(s))).collect::<Vec<_>>().join(", ")
     };
     let report = format!(
         "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"{what}\",\n  \"status\": \"ok\",\n  \
@@ -596,6 +604,13 @@ fn finish_report(
     ExitCode::SUCCESS
 }
 
+/// ⚠️ Instance names arrive with DEF's own escaping — `u_io\\[10\\]` is one name, backslashes and
+/// all. Writing them into JSON unquoted produces a file no JSON parser will read, which is a bug
+/// in the report rather than in the design.
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn placement_json(what: &str, placed: &[Placement], skipped: &[String]) -> String {
     let list = placed
         .iter()
@@ -609,7 +624,7 @@ fn placement_json(what: &str, placed: &[Placement], skipped: &[String]) -> Strin
         .collect::<Vec<_>>()
         .join(",\n");
     let missed =
-        skipped.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        skipped.iter().map(|s| format!("\"{}\"", escape(s))).collect::<Vec<_>>().join(", ");
     format!(
         "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"{what}\",\n  \"status\": \"{}\",\n  \
          \"placed\": {},\n  \"skipped\": [{missed}],\n  \"placements\": [\n{list}\n  ]\n}}",
@@ -749,6 +764,204 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
     db.net_set_sig_type(net, &sig).map_err(|e| format!("cannot type {net}: {e}"))
 }
 
+/// **T1** — give each named pad terminal a block terminal on the die's top routing layer.
+fn place_io_terminals(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let allow_lower = opts.get("allow-non-top-layer").is_some();
+
+    let patterns: Vec<String> = match opts.need("pins") {
+        Ok(v) => v.split_whitespace().map(str::to_string).collect(),
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // The technology's topmost routing layer, which is where a terminal belongs.
+    let top_level = db.tech_get_routing_layer_count();
+    let top_layer = (0..db.tech_get_layer_count())
+        .map(|i| db.layer_name_by_number(i as i64))
+        .find(|n| db.layer_get_routing_level(n) == top_level)
+        .unwrap_or_default();
+
+    // Every `<instance>/<terminal>` in the design, so the patterns can be matched against it.
+    let mut named = Vec::new();
+    for inst in db.inst_names() {
+        for term in db.master_get_m_terms(&db.inst_get_master(&inst)) {
+            named.push(format!("{inst}/{term}"));
+        }
+    }
+    let chosen: Vec<String> = matching(&named, &patterns).into_iter().cloned().collect();
+    if chosen.is_empty() {
+        eprintln!("vyges-pad: no terminals matched {}", patterns.join(" "));
+        return ExitCode::from(2);
+    }
+
+    let mut made = Vec::new();
+    for id in &chosen {
+        let Some((inst, term)) = id.rsplit_once('/') else { continue };
+        let net = db.iterm_get_net(inst, term);
+        // ⚠️ Three quiet skips, all deliberate: an unconnected terminal has no net to bring out,
+        // a floating instance has no settled position, and a cell that is not a PAD is not on the
+        // boundary at all.
+        if net.is_empty()
+            || !matches!(db.inst_get_placement_status(inst).as_str(), "FIRM" | "LOCKED" | "COVER")
+            || !db.master_is_pad(&db.inst_get_master(inst))
+        {
+            continue;
+        }
+
+        let master = db.inst_get_master(inst);
+        let pins: Vec<(String, i32, Rect)> = db
+            .mterm_pin_boxes(&master, term)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(layer, x0, y0, x1, y1)| {
+                let name = db.layer_name_by_number(layer);
+                let level = db.layer_get_routing_level(&name);
+                (name, level, (x0, y0, x1, y1))
+            })
+            .collect();
+        let Some((layer, rect)) = bond_shape(&pins) else {
+            eprintln!("vyges-pad: {inst}/{term} has no shape to make a terminal from");
+            return ExitCode::from(2);
+        };
+        if !allow_lower && layer != top_layer {
+            eprintln!(
+                "vyges-pad: {inst}/{term} has no shape on {top_layer}, only on {layer}"
+            );
+            return ExitCode::from(2);
+        }
+
+        let orient = Orient::parse(&db.inst_get_orient(inst)).unwrap_or(Orient::R0);
+        let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+        if !opts.dry_run {
+            if let Err(e) = make_bterm(&mut db, &net, &layer, pin_shape(rect, orient, origin)) {
+                eprintln!("vyges-pad: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        made.push(format!("{id} -> {net}"));
+    }
+    finish_report(&opts, &mut db, "io-terminals", &made, &[])
+}
+
+/// **F2** — pack the gaps in one row with filler cells.
+fn place_io_fill(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let setup = (|| -> Result<(Track, Vec<Filler>), String> {
+        let row_name = opts.need("row")?;
+        let row = read_row(&db, row_name).ok_or_else(|| format!("no row `{row_name}`"))?;
+        let edge = row.edge().ok_or_else(|| format!("{row_name} is not a recognized IO row"))?;
+        let site = db.row_get_site(row_name);
+        let track = Track {
+            site_width: db.site_get_width(&site).min(db.site_get_height(&site)),
+            row,
+            edge,
+        };
+
+        let overlapping: Vec<String> = opts
+            .get("permit-overlaps")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let mut fillers = Vec::new();
+        for master in opts.need("masters")?.split_whitespace() {
+            let (w, h) = master_size(&db, master)
+                .map_err(|e| format!("cannot measure master `{master}`: {e}"))?;
+            fillers.push(Filler {
+                master: master.to_string(),
+                // Along the row, after the row's own orientation.
+                width: vyges_pad::pad_width(&track, (w, h)),
+                overlapping: overlapping.iter().any(|m| m == master),
+            });
+        }
+        Ok((track, fillers))
+    })();
+
+    let (track, fillers) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // What is already in this row: fixed, non-cover cells that overlap it.
+    let occupied: Vec<(i32, i32)> = db
+        .inst_names()
+        .iter()
+        .filter(|n| {
+            matches!(db.inst_get_placement_status(n).as_str(), "FIRM" | "LOCKED" | "COVER")
+                && !db.master_is_cover(&db.inst_get_master(n))
+        })
+        .filter_map(|n| db.inst_bbox(n).ok())
+        .filter_map(|b| match b[..] {
+            [x0, y0, x1, y1] => Some((x0, y0, x1, y1)),
+            _ => None,
+        })
+        .filter(|&b| intersects(b, track.row.bbox))
+        .map(|b| track.along(b))
+        .collect();
+
+    let planned = fill_row(
+        &track.row.name,
+        track.along(track.row.bbox),
+        &occupied,
+        track.start(),
+        track.site_width,
+        &|at| track.snap_to_site(at),
+        &fillers,
+    );
+    let planned = match planned {
+        Ok(v) => v,
+        Err(Unfilled::Ragged { span }) => {
+            eprintln!(
+                "vyges-pad: filling {} from {} to {} would leave a gap",
+                track.row.name, span.0, span.1
+            );
+            return ExitCode::from(2);
+        }
+        Err(Unfilled::Short { span }) => {
+            eprintln!(
+                "vyges-pad: cannot fill {} from {} to {} with the given cells",
+                track.row.name, span.0, span.1
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut placed = Vec::new();
+    for cell in &planned {
+        let (w, h) = match master_size(&db, &cell.master) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("vyges-pad: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let index = track.snap_to_site(cell.at);
+        let (x, y, orient) = place_in_row(index, &track.row, track.edge, w, h, Orient::R0);
+        let p = Placement { name: cell.name.clone(), master: cell.master.clone(), x, y, orient };
+        if !opts.dry_run {
+            if let Err(e) = commit(&mut db, &p, true) {
+                eprintln!("vyges-pad: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        placed.push(p);
+    }
+    finish(&opts, &mut db, "io-fill", &placed, &[])
+}
+
 /// **D3** — a bond pad on top of every selected pad.
 fn place_bondpad(args: &[String]) -> ExitCode {
     let (opts, mut db) = match open(args) {
@@ -867,7 +1080,6 @@ fn place_bondpad(args: &[String]) -> ExitCode {
                 let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
                 let shape = pin_shape(bond_rect, orient, origin);
                 make_bterm(&mut db, net, &layer, shape)?;
-                make_special(&mut db, net)?;
             }
             Ok(())
         })();
@@ -909,7 +1121,10 @@ fn make_bterm(db: &mut Db, net: &str, layer: &str, shape: Rect) -> Result<(), St
         .create_bterm_pin(&bterm, layer, shape)
         .map_err(|e| format!("cannot add a pin to {bterm}: {e}"))?;
     db.bpin_set_placement_status(&bterm, idx, "FIRM")
-        .map_err(|e| format!("cannot fix {bterm} pin {idx}: {e}"))
+        .map_err(|e| format!("cannot fix {bterm} pin {idx}: {e}"))?;
+    // ⚠️ The reference makes the net special here, inside this step, not at the call site. Both
+    // callers depend on it happening.
+    make_special(db, net)
 }
 
 /// **A4** — wire the ring by abutment.
@@ -1441,6 +1656,8 @@ fn main() -> ExitCode {
         Some("place-pads") => place_pads(&args[1..]),
         Some("connect-by-abutment") => connect_ring(&args[1..]),
         Some("place-bondpad") => place_bondpad(&args[1..]),
+        Some("place-io-fill") => place_io_fill(&args[1..]),
+        Some("place-io-terminals") => place_io_terminals(&args[1..]),
         Some("make-io-bump-array") => make_io_bump_array(&args[1..]),
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),

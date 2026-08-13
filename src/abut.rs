@@ -197,7 +197,11 @@ pub fn connect_by_abutment(
             st.attach(*t, &name);
             plan.connect.push((*t, name.clone()));
         }
-        note_special(&mut plan, &name);
+        // ⚠️ A net created here is **not** special on that account. It becomes special only if the
+        // merge below then joins something else to it. A pair that touches nothing else stays an
+        // ordinary net — and in DEF that is the difference between appearing in NETS and moving
+        // to SPECIALNETS, so getting it wrong relocates hundreds of nets.
+        //
         // A new net can let two previously separate groups join, so the merge runs again.
         merge(&pairs, &mut st, &mut plan)?;
     }
@@ -299,8 +303,22 @@ mod tests {
         let plan = connect_by_abutment(&abutting(None, None), &|_| 0).unwrap();
         assert_eq!(plan.create, vec!["A.VDD_RING"]);
         assert_eq!(plan.connect.len(), 2);
-        assert_eq!(plan.special, vec!["A.VDD_RING"]);
         assert!(plan.destroy.is_empty());
+        // ⚠️ Not special: nothing else joined it. Marking it would move it from NETS to
+        // SPECIALNETS in the written design.
+        assert!(plan.special.is_empty(), "a lone pair is an ordinary net");
+    }
+
+    #[test]
+    fn a_new_net_becomes_special_once_a_third_terminal_joins_it() {
+        let insts = vec![
+            inst("A", (0, 0, 100, 50), vec![term("VDD", (90, 0, 100, 50), None)]),
+            inst("B", (100, 0, 200, 50), vec![term("VDD", (100, 0, 200, 50), None)]),
+            inst("C", (200, 0, 300, 50), vec![term("VDD", (200, 0, 210, 50), None)]),
+        ];
+        let plan = connect_by_abutment(&insts, &|_| 0).unwrap();
+        assert_eq!(plan.create, vec!["A.VDD_RING"]);
+        assert_eq!(plan.special, vec!["A.VDD_RING"], "C joining made it special");
     }
 
     #[test]
