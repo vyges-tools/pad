@@ -75,23 +75,18 @@ pub fn pool_adjacent_violators(positions: &mut [i32], weights: &mut [f32]) -> bo
 /// step, which reads as a placer that cannot place rather than a regression that did not finish.
 ///
 /// Returns whether anything moved, which is what ends the outer loop.
+/// ⚠️ `legal` is expected to return a position **already bounded to the row for that pad** — the
+/// bounds are inset by half the pad's width, so only the caller knows them. An obstruction reaching
+/// past both row ends otherwise makes "step to the far side" land outside the die, and the value
+/// becomes the spring target for every later iteration.
 pub fn pool_round(
     positions: &mut [i32],
     weights: &mut [f32],
-    row: (i32, i32),
     legal: &dyn Fn(usize, i32) -> i32,
 ) -> bool {
     let mut updated = pool_pass(positions, weights);
     for i in 0..positions.len() {
         let fixed = legal(i, positions[i]);
-        // ⚠️ A legalisation that leaves the row is not a position. An obstruction reaching past
-        // both ends makes "step to the far side" land outside the die, and this value becomes the
-        // spring target for every later iteration — a pad pulled at full force towards somewhere
-        // it can never be. Keeping the original is wrong too, but it is *bounded*, and the spread
-        // can still resolve it.
-        if fixed < row.0 || fixed > row.1 {
-            continue;
-        }
         if fixed != positions[i] {
             positions[i] = fixed;
             updated = true;

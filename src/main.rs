@@ -1859,6 +1859,24 @@ fn bump_pads(db: &Db, track: &Track, pads: &[Pad]) -> Vec<BumpPad> {
         .collect()
 }
 
+/// Put the algorithm's last positions into the design, unchecked and marked `PLACED`.
+///
+/// ⚠️ **Unchecked on purpose.** The reference's intermediate placement passes `check = false`: these
+/// are working positions, not a result, and some of them overlap by construction. Running the
+/// conflict test here would refuse the very state the algorithm needs to record.
+fn write_intermediate(db: &mut Db, track: &Track, positions: &[(String, i32)]) {
+    for (name, along) in positions {
+        let master = db.inst_get_master(name);
+        let Ok((w, h)) = master_size(db, &master) else { continue };
+        let (x, y, orient) =
+            place_in_row(track.snap_to_site(*along), &track.row, track.edge, w, h, Orient::R0);
+        let p = Placement { name: name.clone(), master, x, y, orient };
+        if commit(db, &p, false).is_ok() {
+            let _ = db.inst_set_placement_status(name, "PLACED");
+        }
+    }
+}
+
 /// **SP1-SP8** — place a row by spreading pads out from where their bumps want them.
 #[allow(clippy::too_many_arguments)]
 fn place_force_directed(
@@ -1868,6 +1886,14 @@ fn place_force_directed(
     conflict: &mut dyn FnMut(&str, Rect, Orient) -> Option<vyges_pad::Refusal>,
     conflict_probe: &dyn Fn(&str, Rect) -> Option<Rect>,
     settled: &mut dyn FnMut(&Placement),
+    // Where each pad stood when the algorithm last had an opinion, finished or not.
+    //
+    // ⚠️ The reference writes these to the database **as it runs**, so a run that errors leaves the
+    // pads where the algorithm had them, marked `PLACED` rather than `FIRM`. Nothing in our
+    // algorithm reads an instance's position back from the database — the conflict test works from
+    // a list we maintain — so collecting them and applying them at the end is observationally the
+    // same, without threading a mutable database through every closure.
+    intermediate: &mut Vec<(String, i32)>,
 ) -> Result<Vec<Placement>, Refused> {
     use vyges_pad::spread::{forces, ideal_position, spread_pass, Anchor, DAMPER, MAX_ITERATIONS};
     let horizontal = track.horizontal();
@@ -1921,10 +1947,14 @@ fn place_force_directed(
     let mut weights = vec![1.0f32; ordered.len()];
     let legalise = |i: usize, pos: i32| {
         let half = vyges_pad::pad_width(track, pads[i].size) / 2;
+        // ⚠️ Bounded by the row **inset by half this pad's width**, because these are centres. The
+        // raw row edge leaves a pad hanging half its width past the end — and on a fully blocked
+        // row, where every pad is pushed to the far side, that is every pad in the row.
         vyges_pad::spread::nearest_legal(pos, blocked(i, pos), half, row)
+            .clamp(row.0 + half, row.1 - half)
     };
     for _ in 0..ordered.len() {
-        if !vyges_pad::spread::pool_round(&mut ordered, &mut weights, row, &legalise) {
+        if !vyges_pad::spread::pool_round(&mut ordered, &mut weights, &legalise) {
             break;
         }
     }
@@ -1968,6 +1998,12 @@ fn place_force_directed(
             eprintln!("final / {name}: centre {} after {iterations} iterations", anchors[i].centre);
             eprintln!("target / {name}: pooled {} (ideal {})", ordered[i], targets[i]);
         }
+    }
+
+    // The last positions the algorithm settled on, recorded before any of them is checked.
+    intermediate.clear();
+    for (i, a) in anchors.iter().enumerate() {
+        intermediate.push((pads[i].name.clone(), a.min));
     }
 
     // ── Commit ───────────────────────────────────────────────────────────────────────────────
@@ -2139,6 +2175,7 @@ fn place_pads(args: &[String]) -> ExitCode {
             shapes: Vec::new(),
         });
     };
+    let mut intermediate: Vec<(String, i32)> = Vec::new();
     // ⚠️ `i32::MIN` is the marker set above for bump-aligned mode, not a spacing.
     let result = if max_spacing == Some(i32::MIN + 1) {
         let aligned = bump_pads(&db, &track, &pads);
@@ -2157,7 +2194,9 @@ fn place_pads(args: &[String]) -> ExitCode {
                 // bound every jump by the pad's own width.
                 .map(|r| r.blocker)
             };
-            place_force_directed(&track, &pads, &aligned, &mut conflict, &probe, &mut settle)
+            place_force_directed(
+                &track, &pads, &aligned, &mut conflict, &probe, &mut settle, &mut intermediate,
+            )
         }
     } else if max_spacing == Some(i32::MIN) {
         let aligned = bump_pads(&db, &track, &pads);
@@ -2169,10 +2208,18 @@ fn place_pads(args: &[String]) -> ExitCode {
     let placed = match result {
         Ok(v) => v,
         Err(Refused::OutOfRow { name, at }) => {
+            write_intermediate(&mut db, &track, &intermediate);
+            let _ = finish(&opts, &mut db, "pads", &[], &[]);
             eprintln!("vyges-pad: {name} at {at:?} does not fit inside {}", track.row.name);
             return ExitCode::from(2);
         }
         Err(Refused::Blocked { name, at, why }) => {
+            // ⚠️ The design is written out even though the command failed. The reference leaves its
+            // pads wherever the algorithm had them, marked `PLACED`, and a case that expects the
+            // failure compares exactly that. Discarding the work on error leaves the design
+            // untouched, which is a different — and less useful — answer.
+            write_intermediate(&mut db, &track, &intermediate);
+            let _ = finish(&opts, &mut db, "pads", &[], &[]);
             eprintln!(
                 "vyges-pad: cannot place {name} at {at:?}: {:?} overlapping {:?}",
                 why.reason, why.overlap
