@@ -87,8 +87,30 @@ EXIT STATUS:
   2  error    usage error, unreadable database, unknown site, or a failed write
 ";
 
+
+/// The pin, inherited from the crate every engine already depends on.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// The pin this binary was built against, injected into the descriptor at print time.
+///
+/// 🔑 **One definition for the whole programme, inherited rather than typed.** The SHA lives in
+/// `openroad-pin.yaml` in `vyges-opendb-lib` and reaches here through `vyges-opendb`, which this
+/// engine already depends on. Before this, every engine spelled the pin out in its own
+/// `--describe` prose, and four of them were still quoting the previous one a day after it moved.
+///
+/// ⚠️ **It reports what this BINARY was built against — not that the binary is current.** A stale
+/// build reports its stale pin quite happily. That is the point: a harness compares this against
+/// the oracle image it is about to launch and refuses on a mismatch, which is the check that was
+/// missing when two engines ran a whole gate against the previous pin's oracle.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
   "name": "pad",
   "summary": "IO pad and bump placement: the ring of IO rows around the die, and the cells placed into it",
   "maturity": "partial",
@@ -102,7 +124,7 @@ const DESCRIBE: &str = r#"{
       "A corner's WIDTH is the larger of the corner site's width and the horizontal row's depth, so the row abutting it can be what sets the corner size.",
       "The left and right rows are laid on their side when the horizontal and vertical sites are THE SAME SITE, and upright when they differ. The reference compares the site objects; this command compares the names it was given, which is the same thing for a name that resolves to one site.",
       "MEASURED: the ring reproduces the reference row output exactly -- name, site, origin, orientation, direction, site count and pitch -- on all 26 cases that build one, including three real sky130 designs. Pad and corner placement match on all 6 comparable cases.",
-      "Written against the upstream pad sources at pin b5624809f29048e1f9ce9e83eb562620c652e084. The algorithm is reimplemented from the published behavior, not transliterated."
+      "Written against the upstream pad sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
     "args_template": ["make-io-sites", "{odb}"],
@@ -2620,7 +2642,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--describe") => {
-            println!("{DESCRIBE}");
+            println!("{}", describe());
             ExitCode::SUCCESS
         }
         Some("--help") | Some("-h") | None => {
@@ -2706,5 +2728,38 @@ mod tests {
             limits.iter().any(|l| l.as_str().unwrap_or("").contains("MEASURED")),
             "the descriptor must state what was measured"
         );
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{describe, PIN_TOKEN};
+
+    #[test]
+    fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
+        let d = describe();
+        assert!(
+            !d.contains(PIN_TOKEN),
+            "the pin placeholder survived into the output -- the substitution did not run"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&d).expect("the descriptor is still valid JSON once filled in");
+        assert_eq!(
+            v["openroad_pin"], super::CRATE_PIN,
+            "the descriptor must report the pin this binary was actually built against"
+        );
+        assert_eq!(super::CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
+    }
+
+    /// ⛔ The whole point of inheriting the pin is that no engine carries one of its own.
+    #[test]
+    fn no_sha_is_hardcoded_anywhere_in_the_descriptor() {
+        let raw = super::DESCRIBE;
+        for tok in raw.split(|c: char| !c.is_ascii_hexdigit()) {
+            assert!(
+                tok.len() < 40,
+                "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
+            );
+        }
     }
 }
