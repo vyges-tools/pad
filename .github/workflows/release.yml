@@ -7,9 +7,9 @@
 #
 # Produces vyges-pad-<rust-triple>.tar.gz assets whose names + contents match what the vyges CLI
 # expects: install_one() fetches `vyges-pad-<target>.tar.gz` from
-# github.com/vyges-tools/ppl/releases/latest/download/ and extracts a `vyges-pad` binary.
+# github.com/vyges-tools/pad/releases/latest/download/ and extracts a `vyges-pad` binary.
 #
-# This has to exist BEFORE `ifp` is added to the CLI's install list: an engine listed with no
+# This has to exist BEFORE `pad` is added to the CLI's install list: an engine listed with no
 # release behind it turns every `vyges install loom` into a 404 and a failed install.
 #
 # Trigger: push a tag `v*` (publishes a Release with all three assets), or run manually to smoke
