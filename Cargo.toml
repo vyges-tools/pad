@@ -1,6 +1,6 @@
 [package]
 name = "vyges-pad"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2021"
 description = "IO pad and bump placement over the OpenDB database: the pad ring, its cells, and the bump array."
 license = "Apache-2.0"
