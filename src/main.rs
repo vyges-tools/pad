@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `vyges-pad` CLI — the IO pad ring over a `.odb`.
 //!
-//! Today it exposes `make-io-sites`, which builds the ring every later pad command places into.
-//! That is deliberately shippable on its own: a ring whose geometry differs from the reference's
-//! makes every later comparison meaningless, and one that agrees makes the rest checkable a stage
-//! at a time.
+//! It exposes the whole pad flow: `make-io-sites` builds the ring, `place-corners`, `place-pad`,
+//! `place-pads` and `place-io-fill` populate it, `place-bondpad`, `make-io-bump-array`,
+//! `assign-io-bump` and `remove-io-bump[-array]` handle bumps and bond pads,
+//! `place-io-terminals` publishes the terminals, `connect-by-abutment` joins the ring, and
+//! `rdl-route` routes the redistribution layer.
+//!
+//! The RING was shipped first and alone, deliberately: a ring whose geometry differs from the
+//! reference's makes every later comparison meaningless, and one that agrees makes the rest
+//! checkable a stage at a time. That ordering is why the measured claim below is strongest for
+//! the ring -- it is the part with the most reference cases behind it, not the only part built.
+//!
+//! ⚠️ Correlation is NOT uniform across these commands. The ring and corner/pad placement are
+//! measured against reference cases; the later stages are implemented and tested but have no
+//! comparable upstream golden here yet. Do not read "implemented" as "correlated".
 //!
 //! Exit status: 0 rows created, 1 the design cannot carry a ring, 2 usage/read/write error.
 
@@ -25,33 +35,40 @@ use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, Pad
 use vyges_pad::bond::{bond_shape, is_bond_master, matching, pin_shape, place as bond_place};
 use vyges_pad::assign::{assign, BumpTerm, Refused as AssignRefused};
 
+// ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
+// registry is what actually decides it (`group: "physical"`). It read `vyges loom pad`
+// for a release after the construction engines were split out of the loom suite, because
+// nothing ties this string to that registry -- `vyges loom pad` is now REFUSED by the CLI,
+// so the help was telling users a command that no longer runs. If the group ever moves,
+// this string moves with it. Running the binary directly as `vyges-pad` always works and
+// is group-independent.
 const USAGE: &str = "\
-vyges loom pad — IO pad and bump placement: the ring around the die, and what sits in it
+vyges physical pad — IO pad and bump placement: the ring around the die, and what sits in it
 
 USAGE:
-  vyges loom pad make-io-sites  <design.odb> --horizontal-site S --vertical-site S
+  vyges physical pad make-io-sites  <design.odb> --horizontal-site S --vertical-site S
                                 --corner-site S --offset D [options]
-  vyges loom pad place-corners  <design.odb> --master M [--ring-index N] [options]
-  vyges loom pad place-pad      <design.odb> --row R --location D [--master M]
+  vyges physical pad place-corners  <design.odb> --master M [--ring-index N] [options]
+  vyges physical pad place-pad      <design.odb> --row R --location D [--master M]
                                 [--mirror] --inst NAME [options]
-  vyges loom pad make-io-bump-array <design.odb> --bump M --origin 'X Y' --rows N
+  vyges physical pad make-io-bump-array <design.odb> --bump M --origin 'X Y' --rows N
                                    --columns N --pitch 'DX [DY]' [--prefix P] [options]
-  vyges loom pad place-pads <design.odb> --row R --insts 'A B C' [--mode M] [options]
-  vyges loom pad place-io-fill <design.odb> --row R --masters 'A B C'
+  vyges physical pad place-pads <design.odb> --row R --insts 'A B C' [--mode M] [options]
+  vyges physical pad place-io-fill <design.odb> --row R --masters 'A B C'
                               [--permit-overlaps 'M'] [options]
-  vyges loom pad place-io-terminals <design.odb> --pins 'PATTERN...'
+  vyges physical pad place-io-terminals <design.odb> --pins 'PATTERN...'
                                    [--allow-non-top-layer] [options]
-  vyges loom pad rdl-route <design.odb> --layer L [--width W] [--spacing S]
+  vyges physical pad rdl-route <design.odb> --layer L [--width W] [--spacing S]
                           [--allow45] [--grid-only] [options]
-  vyges loom pad assign-io-bump <design.odb> --bump INST --net N
+  vyges physical pad assign-io-bump <design.odb> --bump INST --net N
                                [--terminal INST/PIN] [--dont-route] [options]
-  vyges loom pad connect-by-abutment <design.odb> [options]
-  vyges loom pad place-bondpad <design.odb> --bond M --insts 'PATTERN...'
+  vyges physical pad connect-by-abutment <design.odb> [options]
+  vyges physical pad place-bondpad <design.odb> --bond M --insts 'PATTERN...'
                                [--offset 'X Y'] [--rotation R] [--prefix P] [options]
-  vyges loom pad remove-io-bump <design.odb> --inst NAME [options]
-  vyges loom pad remove-io-bump-array <design.odb> --bump M [options]
-  vyges loom pad --describe
-  vyges loom pad --help
+  vyges physical pad remove-io-bump <design.odb> --inst NAME [options]
+  vyges physical pad remove-io-bump-array <design.odb> --bump M [options]
+  vyges physical pad --describe
+  vyges physical pad --help
 
 OPTIONS:
   --horizontal-site S    site tiling the LEFT and RIGHT rows (required)
@@ -116,10 +133,10 @@ const DESCRIBE: &str = r#"{
   "maturity": "partial",
   "provenance_limitations": [
       "input_hash covers the argument vector, not the content of the .odb it names.",
-      "SCOPE: this build implements the IO RING (`make-io-sites`), single-pad placement (`place-pad`) and corner placement (`place-corners`). Filler, bond-pad and terminal placement, the bump array, distributed pad placement and connection by abutment are not implemented.",
+      "SCOPE: every command listed in --help is implemented and dispatched -- the ring (`make-io-sites`), corner and pad placement (`place-corners`, `place-pad`, `place-pads`), IO fill, bond pads, terminals, the bump array and its removal, bump assignment, connection by abutment, and RDL routing. WHAT DIFFERS ACROSS THEM IS EVIDENCE, NOT EXISTENCE: the ring and corner/pad placement are measured against upstream cases (see MEASURED below); the rest are tested but not yet scored against a reference. An earlier version of this line claimed five of these were `not implemented` long after they shipped -- read a scope claim as a statement about EVIDENCE and check it against --help, which is generated from the same dispatch.",
       "A cell is refused a position by a LAYER-AWARE check, not a bounding-box one: a fixed instance blocks by box refined by its OVERLAP-layer outline where either side declares one, and anything sharing a layer blocks when the moving cell's shapes, grown by that layer's spacing, reach it. A COVER master (a bump) never blocks by box -- only by shared metal.",
       "SIMPLIFICATION: shape nets are not carried, so two shapes on the same net are treated as a conflict. The reference lets them touch. A cell being created has no nets, which is why every supported case is unaffected; a command placing already-connected cells would need them.",
-      "The upstream module also contains a redistribution-layer ROUTER. That is a routing engine and is deliberately out of scope for this one; it is not merely unimplemented, it belongs elsewhere.",
+      "RDL ROUTING is implemented here (`rdl-route`), not deferred elsewhere: bumps are connected to pads across the face of the die on one thick layer, over a graph built from that layer track grid and thinned so neighbouring wires cannot come closer than the requested spacing. This limitation previously said the router was deliberately out of scope, which stopped being true when it was built.",
       "The ring is the die area inset by the offset, corners sized from the corner site, and four edges truncated to WHOLE sites -- a remainder that does not fill a site is given up rather than rounded out.",
       "A corner's WIDTH is the larger of the corner site's width and the horizontal row's depth, so the row abutting it can be what sets the corner size.",
       "The left and right rows are laid on their side when the horizontal and vertical sites are THE SAME SITE, and upright when they differ. The reference compares the site objects; this command compares the names it was given, which is the same thing for a name that resolves to one site.",
@@ -2731,10 +2748,37 @@ mod tests {
         let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("valid JSON");
         assert_eq!(d["name"], "pad");
         let limits = d["provenance_limitations"].as_array().expect("an array");
+        // ⚠️ This assertion used to demand the descriptor call the RDL router OUT OF SCOPE, and it
+        // kept passing long after `rdl-route` shipped -- a test pinning a claim that had stopped
+        // being true, which is worse than no test: it actively defended the stale text against
+        // correction. It now demands the opposite, and demands the WORD the current text uses.
         assert!(
-            limits.iter().any(|l| l.as_str().unwrap_or("").contains("ROUTER")),
-            "the descriptor must say the RDL router is out of scope, not merely absent"
+            limits
+                .iter()
+                .any(|l| l.as_str().unwrap_or("").contains("RDL ROUTING is implemented here")),
+            "the descriptor must state that RDL routing is implemented, not deferred elsewhere"
         );
+        // Nothing may claim a command is unimplemented while `main` dispatches it. The SCOPE line
+        // said five of them were, for a release.
+        for verb in [
+            "rdl-route",
+            "place-bondpad",
+            "connect-by-abutment",
+            "make-io-bump-array",
+            "place-io-terminals",
+        ] {
+            assert!(
+                USAGE.contains(verb),
+                "{verb} is dispatched but absent from USAGE"
+            );
+            assert!(
+                !limits.iter().any(|l| {
+                    let t = l.as_str().unwrap_or("");
+                    t.contains(verb) && t.contains("are not implemented")
+                }),
+                "the descriptor calls {verb} unimplemented, but main dispatches it"
+            );
+        }
         assert!(
             limits.iter().any(|l| l.as_str().unwrap_or("").contains("MEASURED")),
             "the descriptor must state what was measured"
