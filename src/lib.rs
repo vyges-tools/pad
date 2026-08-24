@@ -18,6 +18,12 @@
 //!
 //! Nothing in this module reads a database; the binary does that and hands values in.
 
+/// This crate's version, as Cargo knows it — the single number the whole suite is released on.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The copyright line `--version` prints.
+pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
+
 pub mod abut;
 pub mod assign;
 pub mod bond;
