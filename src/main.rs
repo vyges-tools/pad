@@ -1467,6 +1467,13 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 let s = path.first().and_then(|p| shape_of.get(p)).copied().unwrap_or_default();
                 let t = path.last().and_then(|p| shape_of.get(p)).copied().unwrap_or_default();
                 make_special(&mut db, net)?;
+                // ⛔ **One `dbSWire` per SEGMENT, not per net.** `writeToDb` calls
+                // `dbSWire::create` on every call, so a routed net ends up holding one swire per
+                // segment. The grouping is visible in the DEF — each swire prints its own status
+                // keyword and its remaining wires print `NEW` — so writing everything into a
+                // single swire emits a different file for identical geometry.
+                db.new_swire(net, opts.get("fixed").is_some())
+                    .map_err(|e| format!("{net}: {e}"))?;
                 for piece in rdl::wires(path, w, s, t) {
                     // ⛔ **BOTH kinds, and a diagonal is not a rectangle.** The reference writes an
                     // axis-aligned run as a bounding box and a 45 through a different
