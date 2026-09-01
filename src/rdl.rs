@@ -510,6 +510,31 @@ pub fn segments_intersect(p1: Point, p2: Point, p3: Point, p4: Point) -> bool {
         || (d4 == 0 && on(p1, p4, p2))
 }
 
+/// **G19** — every pairing of a source target with a destination target, in the order tried.
+///
+/// 🔑 Upstream rule (`RDLRouter::route`): the cross product, `stable_sort`ed by centre-to-centre
+/// distance, then by `target0.x`, `target0.y`, `target1.x`, `target1.y`. Each pair is attempted in
+/// turn and the first that routes wins, so this order is the answer whenever two pairings are
+/// equally long.
+///
+/// ⚠️ `distance` is the TRUNCATED Euclidean length, so two pairings that differ by less than one
+/// database unit of length tie here and are settled by the coordinates.
+pub fn target_pairs(src: &[Point], dst: &[Point]) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(usize, usize)> =
+        (0..src.len()).flat_map(|a| (0..dst.len()).map(move |b| (a, b))).collect();
+    pairs.sort_by(|&(la, lb), &(ra, rb)| {
+        let (l0, l1) = (src[la], dst[lb]);
+        let (r0, r1) = (src[ra], dst[rb]);
+        distance(l0, l1)
+            .cmp(&distance(r0, r1))
+            .then(l0.0.cmp(&r0.0))
+            .then(l0.1.cmp(&r0.1))
+            .then(l1.0.cmp(&r1.0))
+            .then(l1.1.cmp(&r1.1))
+    });
+    pairs
+}
+
 /// **G18** — an access line that crosses one of the terminal's own DIAGONAL pin edges is dropped.
 ///
 /// 🔑 Upstream rule (the tail of `populateTerminalAccessPoints`): gather the terminal's polygon
@@ -1215,18 +1240,9 @@ pub fn route_all(
             //
             // ⛔ Collapsing a terminal to one target makes this loop a single attempt. It is
             // invisible on a single-shape pin and decides the result on a bump pad.
-            let mut pairs: Vec<(usize, usize)> =
-                (0..src.1.len()).flat_map(|a| (0..dst.1.len()).map(move |b| (a, b))).collect();
-            pairs.sort_by(|&(la, lb), &(ra, rb)| {
-                let (l0, l1) = (src.1[la].0, dst.1[lb].0);
-                let (r0, r1) = (src.1[ra].0, dst.1[rb].0);
-                distance(l0, l1)
-                    .cmp(&distance(r0, r1))
-                    .then(l0.0.cmp(&r0.0))
-                    .then(l0.1.cmp(&r0.1))
-                    .then(l1.0.cmp(&r1.0))
-                    .then(l1.1.cmp(&r1.1))
-            });
+            let src_centres: Vec<Point> = src.1.iter().map(|t| t.0).collect();
+            let dst_centres: Vec<Point> = dst.1.iter().map(|t| t.0).collect();
+            let pairs = target_pairs(&src_centres, &dst_centres);
 
             let mut laid_path: Option<(Point, Point, Vec<Point>)> = None;
             for (si, di) in pairs {
@@ -2011,5 +2027,121 @@ mod oct_tests {
         assert!(segment_hits_polygon((40, 40), (60, 60), &ring), "lies wholly inside");
         assert!(!segment_hits_polygon((-200, 300), (200, 300), &ring), "clear of it");
         assert!(!segment_hits_polygon((-100, 60), (-50, 60), &ring), "beside it, no crossing");
+    }
+}
+
+#[cfg(test)]
+mod multi_target_tests {
+    use super::*;
+
+    #[test]
+    fn touching_endpoints_and_collinear_overlap_both_count_as_intersecting() {
+        // A clean crossing.
+        assert!(segments_intersect((0, 0), (10, 10), (0, 10), (10, 0)));
+        // Meeting at a single endpoint — `boost::geometry::intersects` says yes, so must we.
+        assert!(segments_intersect((0, 0), (10, 0), (10, 0), (10, 10)));
+        // Collinear and overlapping.
+        assert!(segments_intersect((0, 0), (10, 0), (5, 0), (15, 0)));
+        // Collinear, disjoint.
+        assert!(!segments_intersect((0, 0), (10, 0), (11, 0), (20, 0)));
+        // Parallel, apart.
+        assert!(!segments_intersect((0, 0), (10, 0), (0, 1), (10, 1)));
+        // Would cross if extended, but the segments stop short.
+        assert!(!segments_intersect((0, 0), (1, 1), (5, 10), (10, 5)));
+        // ⚠️ Four T-junctions, one per endpoint, because each is decided by a DIFFERENT clause: the
+        // touching endpoint lies on the other segment's interior, so no strict crossing is found
+        // and only that endpoint's own collinearity test fires. Dropping any one of the four
+        // silently stops detecting a wire that just touches another.
+        assert!(segments_intersect((5, 0), (5, 10), (0, 0), (10, 0)), "p1 on p3p4");
+        assert!(segments_intersect((5, 10), (5, 0), (0, 0), (10, 0)), "p2 on p3p4");
+        assert!(segments_intersect((0, 0), (10, 0), (5, 0), (5, 10)), "p3 on p1p2");
+        assert!(segments_intersect((0, 0), (10, 0), (5, 10), (5, 0)), "p4 on p1p2");
+    }
+
+    // 🔑 Upstream rule: only the polygon's NON-axis-aligned edges block an access line; the
+    // axis-aligned ones are skipped by an explicit test. An octagonal pad's flat sides are
+    // therefore transparent and its facets are not.
+    #[test]
+    fn only_a_diagonal_pin_edge_blocks_an_access_line() {
+        // A unit octagon centred on the origin, closed.
+        let oct = vec![
+            (10, 4),
+            (10, -4),
+            (4, -10),
+            (-4, -10),
+            (-10, -4),
+            (-10, 4),
+            (-4, 10),
+            (4, 10),
+            (10, 4),
+        ];
+        let polys = vec![oct];
+        // Straight out through the flat right side: crosses only an axis-aligned edge — kept.
+        assert_eq!(
+            snaps_clear_of_diagonal_pin_edges((0, 0), &[(40, 0)], &polys),
+            vec![(40, 0)],
+            "an axis-aligned pin edge is not a barrier"
+        );
+        // Out through a facet — dropped.
+        assert!(
+            snaps_clear_of_diagonal_pin_edges((0, 0), &[(40, 40)], &polys).is_empty(),
+            "a diagonal pin edge blocks the access line"
+        );
+        // Both offered: only the clear one survives, and the order is preserved.
+        assert_eq!(
+            snaps_clear_of_diagonal_pin_edges((0, 0), &[(40, 40), (40, 0), (0, -40)], &polys),
+            vec![(40, 0), (0, -40)]
+        );
+    }
+
+    // ⚠️ With no polygon geometry the filter must be a pass-through, not a rejection — nearly every
+    // pin in a design is a plain rectangle.
+    #[test]
+    fn a_terminal_with_no_polygon_geometry_keeps_every_snap() {
+        let snaps = [(1, 2), (3, 4), (5, 6)];
+        assert_eq!(snaps_clear_of_diagonal_pin_edges((0, 0), &snaps, &[]), snaps.to_vec());
+    }
+
+    // 🔑 Upstream rule (`RDLRouter::route`): cross product, sorted by distance then by
+    // target0.x, target0.y, target1.x, target1.y.
+    #[test]
+    fn target_pairs_are_ordered_by_distance_then_by_the_four_coordinates() {
+        // Two sources and two destinations: four pairings, three distinct distances.
+        let src = [(0, 0), (100, 0)];
+        let dst = [(100, 0), (0, 100)];
+        // distances: (0,0)->(100,0) = 100; (0,0)->(0,100) = 100; (100,0)->(100,0) = 0;
+        //            (100,0)->(0,100) = 141
+        assert_eq!(
+            target_pairs(&src, &dst),
+            vec![(1, 0), (0, 1), (0, 0), (1, 1)],
+            "shortest first; the two 100-unit pairings tie on both source coordinates and are \
+             settled by target1.x — (0,100) before (100,0)"
+        );
+    }
+
+    // The tie-break reaches all four coordinates, so a mutant that stops early is caught.
+    #[test]
+    fn an_exact_tie_is_settled_by_the_destination_coordinates() {
+        // One source, two destinations equidistant from it: 3-4-5 both ways.
+        let src = [(0, 0)];
+        let dst = [(4, 3), (3, 4)];
+        assert_eq!(
+            target_pairs(&src, &dst),
+            vec![(0, 1), (0, 0)],
+            "equal distance, so the lower destination x wins: (3,4) before (4,3)"
+        );
+    }
+
+    // ⚠️ `distance` truncates, so two pairings whose true lengths differ by a fraction of a unit
+    // TIE here and fall through to the coordinates. Computing in floating point would order them.
+    #[test]
+    fn distances_that_differ_only_below_a_unit_tie_rather_than_ordering() {
+        assert_eq!(distance((0, 0), (10, 0)), 10);
+        assert_eq!(distance((0, 0), (9, 4)), 9, "sqrt(97) = 9.848… truncates to 9");
+        let src = [(0, 0)];
+        let dst = [(10, 0), (7, 7)];
+        // sqrt(98) = 9.899… also truncates to 9, so (7,7) ties with (9,4) — and beats (10,0).
+        assert_eq!(distance((0, 0), (7, 7)), 9);
+        assert_eq!(target_pairs(&src, &dst), vec![(0, 1), (0, 0)]);
     }
 }
