@@ -120,7 +120,33 @@ pub fn distance(p0: Point, p1: Point) -> i64 {
 /// chosen arbitrarily. Dropping it does not make routes longer, it makes them unstable.
 pub fn edge_weight(p0: Point, p1: Point, scale: f32) -> i64 {
     let bias = i64::from(p0.1 == p1.1);
-    (scale * distance(p0, p1) as f32) as i64 + bias
+    // ⚠️ Upstream is `const int64_t weight = edge_weight_scale * distance(p0, p1) + direction_bias;`
+    // — a `float * int64_t + int64_t` expression evaluated wholly in float and truncated ONCE, at
+    // the assignment. Truncating the product first and adding the bias afterwards is a different
+    // number whenever the product lands just below an integer, which is exactly what a restored
+    // edge's recovered scale produces.
+    (scale * distance(p0, p1) as f32 + bias as f32) as i64
+}
+
+/// **G5a** — the scale `removeGraphEdge` hands back, recovered by DIVISION.
+///
+/// ⛔ **Upstream does not store the scale; it divides the weight by the distance to get it back**:
+///
+/// ```text
+/// removeGraphEdge: const float weight = graph_weight_[edge];
+///                  return {p0, p1, weight / distance(p0, p1)};
+/// uncommitRoute:   addGraphEdge(p0, p1, weight, false, false);   // that quotient, as the SCALE
+/// removeTerminalAccess: addGraphEdge(pt0, pt1, weight, true, true);
+/// ```
+///
+/// 🔑 **The round trip does not return the original weight.** A horizontal edge is stored as
+/// `d + 1` (the `direction_bias`), so the recovered scale is `(d + 1) / d`, and re-adding gives
+/// `(d + 1) + 1 = d + 2`. **Every rip-up or terminal-access cycle makes a horizontal edge one unit
+/// dearer**; vertical and 45° edges carry no bias, recover a scale of exactly 1.0, and are
+/// unchanged. ⚠️ Measured in the reference's own `Router_edge` log for `rdl_route_45`: **548 edges
+/// restored at weight 25602** where a fresh one of that length is 25601.
+pub fn restore_scale(p0: Point, p1: Point, weight: i64) -> f32 {
+    weight as f32 / distance(p0, p1) as f32
 }
 
 /// A rectangle, already bloated by the clearance the router must keep.
@@ -382,7 +408,8 @@ impl Graph {
 /// Edges to put back when a temporary change is undone.
 #[derive(Debug, Clone, Default)]
 pub struct Undo {
-    pub restore: Vec<(usize, usize, i64)>,
+    /// `(a, b, scale)` — the scale `removeGraphEdge` recovers by division, not the weight.
+    pub restore: Vec<(usize, usize, f32)>,
     pub cut: Vec<(usize, usize)>,
 }
 
@@ -392,7 +419,8 @@ impl Graph {
         for &(a, b) in &undo.cut {
             self.cut(a, b);
         }
-        for &(a, b, w) in &undo.restore {
+        for &(a, b, scale) in &undo.restore {
+            let w = edge_weight(self.points[a], self.points[b], scale);
             self.join(a, b, w);
         }
     }
@@ -442,7 +470,7 @@ pub fn insert_access(
             .collect();
         if let [a, b] = ends[..] {
             if let Some(w) = graph.weight_between(a, b) {
-                undo.restore.push((a, b, w));
+                undo.restore.push((a, b, restore_scale(graph.points[a], graph.points[b], w)));
             }
             graph.cut(a, b);
         }
@@ -489,7 +517,8 @@ pub fn insert_access(
                     .collect();
                 for o in doomed {
                     if let Some(w) = graph.weight_between(e, o) {
-                        undo.restore.push((e, o, w));
+                        undo.restore
+                            .push((e, o, restore_scale(graph.points[e], graph.points[o], w)));
                     }
                     graph.cut(e, o);
                 }
@@ -803,7 +832,7 @@ pub fn commit_route(
 
     for (a, b) in drop {
         if let Some(w) = graph.weight_between(a, b) {
-            undo.restore.push((a, b, w));
+            undo.restore.push((a, b, restore_scale(graph.points[a], graph.points[b], w)));
             graph.cut(a, b);
         }
     }
