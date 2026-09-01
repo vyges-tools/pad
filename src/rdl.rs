@@ -397,7 +397,7 @@ impl Graph {
         }
     }
 
-    fn weight_between(&self, a: usize, b: usize) -> Option<i64> {
+    pub fn weight_between(&self, a: usize, b: usize) -> Option<i64> {
         self.adj[a].iter().find(|&&(v, _)| v == b).map(|&(_, w)| w)
     }
 }

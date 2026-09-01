@@ -1322,8 +1322,67 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 rdl::blocked(a, b, &obstructions)
             });
         }
+        // ⛔ **Cost the reference's path in OUR graph**, rather than assuming the two are a tie.
+        // `--path-cost` takes the other side's CORNERS, walks the tracks between them, and sums the
+        // same edge weights the search uses — reporting any pair that is not an edge at all. Two
+        // routes of equal length and equal turn count were *assumed* to cost the same; assuming is
+        // how three earlier readings in this engine went wrong.
+        if let Some(corners) = opts.get("path-cost") {
+            let v: Vec<i32> = corners.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            let pts: Vec<rdl::Point> = v.chunks(2).map(|c| (c[0], c[1])).collect();
+            let mut walk: Vec<rdl::Point> = Vec::new();
+            for w in pts.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                walk.push(a);
+                // ⚠️ Expand only along a line that IS a track. A run between a terminal centre
+                // and its access point shares a coordinate but lies on no track, and the two are
+                // joined by ONE access edge — walking tracks across it invents vertices.
+                if a.0 == b.0 && g.x.binary_search(&a.0).is_ok() {
+                    let mut ys: Vec<i32> =
+                        g.y.iter().copied().filter(|&y| y > a.1.min(b.1) && y < a.1.max(b.1)).collect();
+                    if a.1 > b.1 { ys.reverse(); }
+                    walk.extend(ys.into_iter().map(|y| (a.0, y)));
+                } else if a.1 == b.1 && g.y.binary_search(&a.1).is_ok() {
+                    let mut xs: Vec<i32> =
+                        g.x.iter().copied().filter(|&x| x > a.0.min(b.0) && x < a.0.max(b.0)).collect();
+                    if a.0 > b.0 { xs.reverse(); }
+                    walk.extend(xs.into_iter().map(|x| (x, a.1)));
+                }
+            }
+            walk.push(*pts.last().unwrap());
+            let mut total: i64 = 0;
+            let mut missing = 0;
+            for pair in walk.windows(2) {
+                let (Some(&i), Some(&j)) =
+                    (graph.index.get(&pair[0]), graph.index.get(&pair[1]))
+                else {
+                    println!("MISSING VERTEX {:?} or {:?}", pair[0], pair[1]);
+                    missing += 1;
+                    continue;
+                };
+                match graph.weight_between(i, j) {
+                    Some(w) => total += w,
+                    None => {
+                        println!("MISSING EDGE {:?} -> {:?}", pair[0], pair[1]);
+                        missing += 1;
+                    }
+                }
+            }
+            println!("path-cost: {total} over {} segments, {missing} missing", walk.len() - 1);
+        }
         let path = rdl::shortest_path(&graph, (sx, sy), (tx, ty), turn);
         println!("{{\"segments\": {}}}", path.len());
+        {
+            let mut total: i64 = 0;
+            for pair in path.windows(2) {
+                if let (Some(&i), Some(&j)) =
+                    (graph.index.get(&pair[0]), graph.index.get(&pair[1]))
+                {
+                    total += graph.weight_between(i, j).unwrap_or(0);
+                }
+            }
+            println!("ours-cost: {total} over {} segments", path.len().saturating_sub(1));
+        }
         if opts.get("wires").is_some() {
             // The pin rectangles the two ends land on, so the end runs can reach into them.
             let shape_of = |c: (i32, i32)| {
@@ -1346,6 +1405,74 @@ fn rdl_route(args: &[String]) -> ExitCode {
             }
         }
         return ExitCode::SUCCESS;
+    }
+    // ⛔ **The GRID's coordinates, not its size.** The graph was checked against the reference by
+    // COUNT — 140625 vertices, 245857 edges — and a count is not an identity: two grids of 375 x
+    // 375 tracks agree on every number and can name different tracks. `makeGraph` thins the layer's
+    // track grid with `pitch = width + spacing - 1` from `width / 2 + 1`, so an off-by-one anywhere
+    // in that filter, or a different track list going into it, offsets every track and still counts
+    // the same. Compare against the reference's own `Router_vertex` level-1 dump.
+    if let Some(path) = opts.get("grid-report") {
+        let mut body = String::new();
+        for x in &g.x {
+            body.push_str(&format!("x {x}\n"));
+        }
+        for y in &g.y {
+            body.push_str(&format!("y {y}\n"));
+        }
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    // ⛔ **The EDGE SET, not the edge count.** 245857 edges on both sides was checked and is not
+    // an identity either: the same number of edges can join different pairs. Each line is one
+    // undirected edge with its endpoints in a canonical order and its weight, so the reference's
+    // own `Router_edge` level-1 "Adding edge from (x, y) to (x, y) with weight w" dump can be
+    // sorted and diffed against it directly.
+    if let Some(path) = opts.get("edge-report") {
+        let graph = rdl::Graph::build(&g, &clear, 1.0);
+        let mut lines: Vec<String> = Vec::new();
+        for (u, out) in graph.adj.iter().enumerate() {
+            for &(v, w) in out {
+                if u >= v {
+                    continue; // each undirected edge once
+                }
+                let (a, b) = (graph.points[u], graph.points[v]);
+                lines.push(format!("{} {} {} {} {w}", a.0, a.1, b.0, b.1));
+            }
+        }
+        lines.sort();
+        if let Err(e) = std::fs::write(path, lines.join("\n") + "\n") {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    // ⛔ **Per-vertex ADJACENCY ORDER, for every vertex.** This was checked once, for a single
+    // vertex, and found to be `[left, down, up, right]`. That is not enough: on an equal-cost tie
+    // the winner is decided by which neighbour is relaxed and pushed FIRST, so the order has to
+    // hold at every vertex, not at one. Upstream's order is the order edges were added to the
+    // `boost::adjacency_list` — `add_edge(a, b)` appends to BOTH a's and b's out-edge list — so it
+    // is `makeGraph`'s insertion order, recoverable from its `Router_edge` level-1 dump.
+    //
+    // ⚠️ Emitted in STORED order, never sorted. Sorting it would compare a different thing and
+    // agree when the engine does not.
+    if let Some(path) = opts.get("adj-report") {
+        let graph = rdl::Graph::build(&g, &clear, 1.0);
+        let mut body = String::new();
+        for (u, out) in graph.adj.iter().enumerate() {
+            let p = graph.points[u];
+            body.push_str(&format!("{} {}:", p.0, p.1));
+            for &(v, _) in out {
+                let q = graph.points[v];
+                body.push_str(&format!(" {},{}", q.0, q.1));
+            }
+            body.push('\n');
+        }
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
     }
     if let Some(path) = opts.get("net-centre-report") {
         let mut body = String::new();
