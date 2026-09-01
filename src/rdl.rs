@@ -424,12 +424,131 @@ pub fn insert_access(
     undo
 }
 
+/// **G17** — the swept octagon a 45° wire occupies, upstream's `RDLSegment::getEdgeObstruction`.
+///
+/// 🔑 **The whole calculation, transcribed** (`RDLSegment.cpp` + `odb::Oct` in `geom.h`):
+///
+/// ```text
+/// Oct(p0, p1, 2*dist):  high = the point with the LARGER y (a tie makes p1 high); A = width/2
+/// dir:                  RIGHT if high.x > low.x, else LEFT
+/// B = ceil((A * 2) / sqrt2) - A
+/// p0 = p8 = (low.x-B,  low.y-A)      p1 = (low.x+B,  low.y-A)
+/// p4      = (high.x+B, high.y+A)     p5 = (high.x-B, high.y+A)
+/// RIGHT:  p2=(high.x+A,high.y-B) p3=(high.x+A,high.y+B) p6=(low.x-A,low.y+B)  p7=(low.x-A,low.y-B)
+/// LEFT:   p2=(low.x+A, low.y-B)  p3=(low.x+A, low.y+B)  p6=(high.x-A,high.y+B) p7=(high.x-A,high.y-B)
+/// then, with A == dist:
+/// RIGHT:  p1.x = low.x+dist;  p2.y = high.y-dist;  p5.x = high.x-dist;  p6.y = low.y+dist
+/// LEFT:   p3.y = low.y+dist;  p4.x = high.x+dist;  p7.y = high.y-dist;  p8.x = low.x-dist; p0 = p8
+/// ```
+///
+/// ⚠️ **Three numeric details, all load-bearing.** `A = width / 2` is INTEGER division; `B`'s
+/// `ceil` happens in `f64` and is then TRUNCATED into an integer; and **only the LEFT branch
+/// re-closes the ring** by reassigning `p0` — the RIGHT branch leaves `p0 == p8` because it
+/// touches neither. Writing `B` in exact arithmetic, or closing the ring in both branches, is a
+/// different polygon.
+///
+/// Returns the 9-point ring, first point repeated last.
+pub fn edge_obstruction(p0: Point, p1: Point, dist: i32) -> Vec<Point> {
+    // `Oct(p0, p1, 2 * dist)` — so A is exactly `dist`.
+    let (low, high) = if p0.1 > p1.1 { (p1, p0) } else { (p0, p1) };
+    let a = (2 * dist) / 2;
+    let b = (((a * 2) as f64) / std::f64::consts::SQRT_2).ceil() as i32 - a;
+    let right = high.0 > low.0;
+
+    let mut pts = vec![(0, 0); 9];
+    pts[0] = (low.0 - b, low.1 - a);
+    pts[8] = pts[0];
+    pts[1] = (low.0 + b, low.1 - a);
+    pts[4] = (high.0 + b, high.1 + a);
+    pts[5] = (high.0 - b, high.1 + a);
+    if right {
+        pts[2] = (high.0 + a, high.1 - b);
+        pts[3] = (high.0 + a, high.1 + b);
+        pts[6] = (low.0 - a, low.1 + b);
+        pts[7] = (low.0 - a, low.1 - b);
+    } else {
+        pts[2] = (low.0 + a, low.1 - b);
+        pts[3] = (low.0 + a, low.1 + b);
+        pts[6] = (high.0 - a, high.1 + b);
+        pts[7] = (high.0 - a, high.1 - b);
+    }
+
+    if right {
+        pts[1].0 = low.0 + dist;
+        pts[2].1 = high.1 - dist;
+        pts[5].0 = high.0 - dist;
+        pts[6].1 = low.1 + dist;
+    } else {
+        pts[3].1 = low.1 + dist;
+        pts[4].0 = high.0 + dist;
+        pts[7].1 = high.1 - dist;
+        pts[8].0 = low.0 - dist;
+        pts[0] = pts[8];
+    }
+    pts
+}
+
+/// Does the segment `a`–`b` touch the closed ring `poly`?
+///
+/// The ring is convex, so a segment misses it only when it misses every edge AND neither end is
+/// inside. Both tests are integer; nothing here rounds.
+pub fn segment_hits_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
+    let cross = |o: Point, p: Point, q: Point| -> i64 {
+        (p.0 - o.0) as i64 * (q.1 - o.1) as i64 - (p.1 - o.1) as i64 * (q.0 - o.0) as i64
+    };
+    let on = |o: Point, p: Point, q: Point| -> bool {
+        q.0.min(o.0) <= p.0 && p.0 <= q.0.max(o.0) && q.1.min(o.1) <= p.1 && p.1 <= q.1.max(o.1)
+    };
+    let segs_cross = |p1: Point, p2: Point, p3: Point, p4: Point| -> bool {
+        let (d1, d2) = (cross(p3, p4, p1), cross(p3, p4, p2));
+        let (d3, d4) = (cross(p1, p2, p3), cross(p1, p2, p4));
+        if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+            && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
+        {
+            return true;
+        }
+        (d1 == 0 && on(p3, p1, p4))
+            || (d2 == 0 && on(p3, p2, p4))
+            || (d3 == 0 && on(p1, p3, p2))
+            || (d4 == 0 && on(p1, p4, p2))
+    };
+    for w in poly.windows(2) {
+        if segs_cross(a, b, w[0], w[1]) {
+            return true;
+        }
+    }
+    // Neither edge crossed: the segment is either wholly inside or wholly outside. A ray cast
+    // from one end settles it.
+    let inside = |pt: Point| -> bool {
+        let mut c = false;
+        for w in poly.windows(2) {
+            let (i, j) = (w[0], w[1]);
+            if (i.1 > pt.1) != (j.1 > pt.1) {
+                let t = (pt.1 - i.1) as i64 * (j.0 - i.0) as i64;
+                let u = (j.1 - i.1) as i64;
+                let x = i.0 as i64 + if u != 0 { t / u } else { 0 };
+                if (pt.0 as i64) < x {
+                    c = !c;
+                }
+            }
+        }
+        c
+    };
+    inside(a)
+}
+
 /// **L6** — take a routed path out of the graph, recording how to put it back.
 ///
 /// Every edge touching a route vertex goes, and so does every edge crossing the route's corridor.
 /// ⚠️ Recorded rather than simply deleted: rip-up has to restore exactly these edges, and
 /// recomputing which ones they were after the graph has moved on gives a different set.
-pub fn commit_route(graph: &mut Graph, route: &[Point], width: i32, spacing: i32) -> Undo {
+pub fn commit_route(
+    graph: &mut Graph,
+    route: &[Point],
+    width: i32,
+    spacing: i32,
+    allow45: bool,
+) -> Undo {
     let mut undo = Undo::default();
     let corridor = commit_corridor(route, width, spacing);
     let mut drop: std::collections::BTreeSet<(usize, usize)> = Default::default();
@@ -474,6 +593,34 @@ pub fn commit_route(graph: &mut Graph, route: &[Point], width: i32, spacing: i32
             }
         }
     }
+    // ⛔ **Under `allow45`, a committed DIAGONAL also blocks what crosses its swept octagon.**
+    // This is the third and last of the reference's `allow45` sites, and it runs after the two
+    // above because everything accumulates into one set before anything is removed.
+    //
+    // ⚠️ **The loop starts at 2, so the FIRST segment is never checked.** That is the reference's
+    // own off-by-one (`for (std::size_t i = 2; i < route.size(); i++)`), reproduced rather than
+    // tidied: starting at 1 removes edges it keeps.
+    if allow45 {
+        let d = width / 2 + spacing + 1;
+        for i in 2..route.len() {
+            let (p0, p1) = (route[i - 1], route[i]);
+            if p0.0 == p1.0 || p0.1 == p1.1 {
+                continue;                       // `is45DegreeEdge` is simply "not axis-aligned"
+            }
+            let poly = edge_obstruction(p0, p1, d);
+            for (vi, &p) in graph.points.iter().enumerate() {
+                for &(o, _) in &graph.adj[vi] {
+                    if o < vi {
+                        continue;               // each undirected edge once
+                    }
+                    if segment_hits_polygon(p, graph.points[o], &poly) {
+                        drop.insert((vi, o));
+                    }
+                }
+            }
+        }
+    }
+
     for (a, b) in drop {
         if let Some(w) = graph.weight_between(a, b) {
             undo.restore.push((a, b, w));
@@ -1028,7 +1175,7 @@ pub fn route_all(
                 let laid_paths: Vec<Vec<Point>> =
                     routes.iter().filter(|r| r.routed).map(|r| r.points.clone()).collect();
                 for pts in &laid_paths {
-                    commit_route(graph, pts, width, spacing);
+                    commit_route(graph, pts, width, spacing, allow45);
                 }
             }
             // ⚠️ Filtered against what is already on the die, every time.
@@ -1060,7 +1207,7 @@ pub fn route_all(
             // so committing first removes the edges around them too; undoing the access first
             // leaves those edges in place and the next route may run straight past a terminal
             // another route is already using.
-            committed[i] = Some(commit_route(graph, &path, width, spacing));
+            committed[i] = Some(commit_route(graph, &path, width, spacing, allow45));
             graph.undo(&b);
             graph.undo(&a);
             routes[i].routed = true;
@@ -1612,5 +1759,181 @@ mod tests {
     #[test]
     fn the_weight_scale_multiplies_the_distance_but_not_the_bias() {
         assert_eq!(edge_weight((0, 0), (100, 0), 2.0), 201);
+    }
+}
+
+#[cfg(test)]
+mod oct_commit_tests {
+    use super::*;
+
+    // 🔑 Upstream rule (`RDLRouter::commitRoute`, third `allow45` block):
+    //     `for (std::size_t i = 2; i < route.size(); i++)` — the octagon of the route's FIRST
+    // segment is never applied. Reproduced rather than corrected: starting at 1 removes edges the
+    // reference keeps, and the router then fails to find paths it should find.
+    //
+    // Route (0,0) -> (100,100) -> (200,0), width 20, spacing 0, so d = 20/2 + 0 + 1 = 11.
+    //   segment 1 octagon spans x -11..111 — would swallow the probe at (40,60)-(60,40)
+    //   segment 2 octagon spans x  89..211 — swallows the probe at (140,60)-(160,40)
+    // Both probes sit clear of every per-vertex corridor square (±11, widened by the 20-unit edge
+    // span to ±31), so steps 1 and 2 cannot account for either verdict.
+    #[test]
+    fn the_first_segments_octagon_is_never_applied() {
+        let grid = Grid { x: vec![40, 60, 140, 160], y: vec![40, 60] };
+        let probe1 = ((40, 60), (60, 40));
+        let probe2 = ((140, 60), (160, 40));
+        let mut graph = Graph::build(&grid, &[probe1, probe2], 1.0);
+        let (a1, b1) = (graph.index[&probe1.0], graph.index[&probe1.1]);
+        let (a2, b2) = (graph.index[&probe2.0], graph.index[&probe2.1]);
+        assert!(graph.weight_between(a1, b1).is_some() && graph.weight_between(a2, b2).is_some());
+
+        commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, true);
+
+        assert!(
+            graph.weight_between(a1, b1).is_some(),
+            "the first segment is skipped, so its octagon must not cut this edge"
+        );
+        assert!(
+            graph.weight_between(a2, b2).is_none(),
+            "the second segment IS checked, so its octagon must cut this edge"
+        );
+    }
+
+    // 🔑 `is45DegreeEdge` is simply "not axis-aligned", so an orthogonal segment contributes NO
+    // octagon. It would contribute a large one if the guard were dropped: `Oct` of a horizontal
+    // (100,100)-(200,100) at dist 11 covers x 89..211, y 89..111, which swallows this probe.
+    #[test]
+    fn an_axis_aligned_segment_contributes_no_octagon() {
+        let grid = Grid { x: vec![150, 160], y: vec![95, 105] };
+        let probe = ((150, 95), (160, 105));
+        let mut graph = Graph::build(&grid, &[probe], 1.0);
+        let (a, b) = (graph.index[&probe.0], graph.index[&probe.1]);
+        commit_route(&mut graph, &[(0, 0), (100, 100), (200, 100)], 20, 0, true);
+        assert!(
+            graph.weight_between(a, b).is_some(),
+            "the horizontal second segment must not build an octagon"
+        );
+    }
+
+    // ⚠️ The octagon is built at `dist = width/2 + spacing + 1`, the same `d` as the corridor
+    // squares — not at half-width, and not at width. For the (100,100)-(200,0) segment that puts
+    // the long sides on `x + y = 178` and `x + y = 222`; at `d/2` they would be 190 and 210. This
+    // probe sits on `x + y = 215`: inside at the right `dist`, outside at any smaller one.
+    #[test]
+    fn the_octagon_is_built_at_the_corridor_distance() {
+        let grid = Grid { x: vec![160, 165], y: vec![50, 55] };
+        let probe = ((160, 55), (165, 50));
+        let mut graph = Graph::build(&grid, &[probe], 1.0);
+        let (a, b) = (graph.index[&probe.0], graph.index[&probe.1]);
+        commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, true);
+        assert!(
+            graph.weight_between(a, b).is_none(),
+            "x + y = 215 lies within the 178..222 band the full-distance octagon covers"
+        );
+    }
+
+    // …and the band's far edge, so a too-WIDE octagon is caught too: `x + y = 235` is outside the
+    // 178..222 band at the right `dist`, but inside the 156..244 band `2 * dist` would give.
+    #[test]
+    fn the_octagon_is_no_wider_than_the_corridor_distance() {
+        let grid = Grid { x: vec![170, 175], y: vec![60, 65] };
+        let probe = ((170, 65), (175, 60));
+        let mut graph = Graph::build(&grid, &[probe], 1.0);
+        let (a, b) = (graph.index[&probe.0], graph.index[&probe.1]);
+        commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, true);
+        assert!(graph.weight_between(a, b).is_some(), "x + y = 235 is clear of the octagon");
+    }
+
+    // The same route without `allow45` leaves both probes alone — proof the verdict above comes
+    // from the octagon block and not from the corridor squares.
+    #[test]
+    fn without_allow45_no_octagon_is_applied_at_all() {
+        let grid = Grid { x: vec![40, 60, 140, 160], y: vec![40, 60] };
+        let (probe1, probe2) = (((40, 60), (60, 40)), ((140, 60), (160, 40)));
+        let mut graph = Graph::build(&grid, &[probe1, probe2], 1.0);
+        let (a2, b2) = (graph.index[&probe2.0], graph.index[&probe2.1]);
+        commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, false);
+        assert!(graph.weight_between(a2, b2).is_some());
+    }
+}
+
+#[cfg(test)]
+mod oct_tests {
+    use super::*;
+
+    // 🔑 Upstream rule (`odb::Oct::init` + `RDLSegment::getEdgeObstruction`): the octagon swept by
+    // a 45° wire of half-width `dist`. Values below are hand-computed from that arithmetic, NOT
+    // read back from this implementation.
+    //
+    //   A = (2*dist)/2 = dist = 10;  B = ceil(20 / sqrt2) - 10 = ceil(14.142…) - 10 = 15 - 10 = 5
+    #[test]
+    fn a_rising_diagonal_sweeps_the_right_handed_octagon() {
+        let ring = edge_obstruction((0, 0), (100, 100), 10);
+        assert_eq!(
+            ring,
+            vec![
+                (-5, -10),   // p0 — ⚠️ NOT re-closed on the RIGHT branch, so it keeps `low.x - B`
+                (10, -10),   // p1, x moved to low.x + dist
+                (110, 90),   // p2, y moved to high.y - dist
+                (110, 105),  // p3
+                (105, 110),  // p4
+                (90, 110),   // p5, x moved to high.x - dist
+                (-10, 10),   // p6, y moved to low.y + dist
+                (-10, -5),   // p7
+                (-5, -10),   // p8 == p0
+            ]
+        );
+    }
+
+    // A falling diagonal takes the LEFT branch — and the LEFT branch is the only one that
+    // reassigns p0 from the mutated p8. Dropping that reassignment leaves a ring whose first and
+    // last points disagree.
+    #[test]
+    fn a_falling_diagonal_sweeps_the_left_handed_octagon_and_recloses_the_ring() {
+        let ring = edge_obstruction((100, 0), (0, 100), 10);
+        assert_eq!(
+            ring,
+            vec![
+                (90, -10),   // p0 — reassigned from p8 AFTER p8.x moved to low.x - dist
+                (105, -10),  // p1
+                (110, -5),   // p2
+                (110, 10),   // p3, y moved to low.y + dist
+                (10, 110),   // p4, x moved to high.x + dist
+                (-5, 110),   // p5
+                (-10, 105),  // p6
+                (-10, 90),   // p7, y moved to high.y - dist
+                (90, -10),   // p8
+            ]
+        );
+        assert_eq!(ring[0], ring[8], "the ring must close");
+    }
+
+    // ⚠️ `A = width / 2` is INTEGER division and `B`'s ceil happens in f64 then truncates.
+    // dist = 3: A = 3, B = ceil(6/sqrt2) - 3 = ceil(4.2426…) - 3 = 5 - 3 = 2. Exact arithmetic
+    // would give a different B for any dist where 2A/sqrt2 lands just above an integer.
+    #[test]
+    fn b_is_a_truncated_double_ceil_not_exact_arithmetic() {
+        let ring = edge_obstruction((0, 0), (50, 50), 3);
+        assert_eq!(ring[7], (-3, -2), "p7 = (low.x - A, low.y - B) = (-3, -2)");
+        assert_eq!(ring[0], (-2, -3), "p0 = (low.x - B, low.y - A) = (-2, -3)");
+    }
+
+    // ⚠️ On a y-tie the SECOND point is `high` (`Oct::init` picks the larger y, ties to p2).
+    // Unreachable through `commit_route` — `is45DegreeEdge` filters axis-aligned edges out first —
+    // but pinned so the transcription cannot silently flip.
+    #[test]
+    fn a_y_tie_makes_the_second_point_high() {
+        // low = (0,0), high = (100,0), RIGHT: p4 = (high.x + B, high.y + A) = (105, 10).
+        assert_eq!(edge_obstruction((0, 0), (100, 0), 10)[4], (105, 10));
+        // Reversed, low = (100,0) and high = (0,0), so it is LEFT: p4.x moves to high.x + dist.
+        assert_eq!(edge_obstruction((100, 0), (0, 0), 10)[4], (10, 10));
+    }
+
+    #[test]
+    fn a_segment_through_the_octagon_hits_and_one_clear_of_it_misses() {
+        let ring = edge_obstruction((0, 0), (100, 100), 10);
+        assert!(segment_hits_polygon((0, 100), (100, 0), &ring), "crosses the body");
+        assert!(segment_hits_polygon((40, 40), (60, 60), &ring), "lies wholly inside");
+        assert!(!segment_hits_polygon((-200, 300), (200, 300), &ring), "clear of it");
+        assert!(!segment_hits_polygon((-100, 60), (-50, 60), &ring), "beside it, no crossing");
     }
 }
