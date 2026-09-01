@@ -136,6 +136,7 @@ const DESCRIBE: &str = r#"{
       "SCOPE: every command listed in --help is implemented and dispatched -- the ring (`make-io-sites`), corner and pad placement (`place-corners`, `place-pad`, `place-pads`), IO fill, bond pads, terminals, the bump array and its removal, bump assignment, connection by abutment, and RDL routing. WHAT DIFFERS ACROSS THEM IS EVIDENCE, NOT EXISTENCE: the ring and corner/pad placement are measured against upstream cases (see MEASURED below); the rest are tested but not yet scored against a reference. An earlier version of this line claimed five of these were `not implemented` long after they shipped -- read a scope claim as a statement about EVIDENCE and check it against --help, which is generated from the same dispatch.",
       "A cell is refused a position by a LAYER-AWARE check, not a bounding-box one: a fixed instance blocks by box refined by its OVERLAP-layer outline where either side declares one, and anything sharing a layer blocks when the moving cell's shapes, grown by that layer's spacing, reach it. A COVER master (a bump) never blocks by box -- only by shared metal.",
       "SIMPLIFICATION: shape nets are not carried, so two shapes on the same net are treated as a conflict. The reference lets them touch. A cell being created has no nets, which is why every supported case is unaffected; a command placing already-connected cells would need them.",
+      "ABSENCE, stated because the SCOPE line above lists what EXISTS and is therefore silent about what does not. Two of upstream's fifteen commands have no counterpart here: `make_fake_io_site` (upstream's own corpus exercises it 4 times) and `remove_io_rows` (which upstream ships and nothing tests). Three OPTIONS of commands that do exist are not honoured: `rdl-route --bump-via` and `--pad-via` name an access via this engine does not build and are now REFUSED with exit 3 rather than accepted and ignored; `assign-io-bump --dont-route` writes nothing, which is faithful -- upstream stores it only in `ICeWall::routing_map_`, a member of the command object -- but it therefore cannot reach `rdl-route`, which is a separate process here, so a bump upstream would leave alone is routed. Upstream has the same hole across its own `write_db`.",
       "RDL ROUTING is implemented here (`rdl-route`), not deferred elsewhere: bumps are connected to pads across the face of the die on one thick layer, over a graph built from that layer track grid and thinned so neighbouring wires cannot come closer than the requested spacing. This limitation previously said the router was deliberately out of scope, which stopped being true when it was built.",
       "The ring is the die area inset by the offset, corners sized from the corner site, and four edges truncated to WHOLE sites -- a remainder that does not fill a site is given up rather than rounded out.",
       "A corner's WIDTH is the larger of the corner site's width and the horizontal row's depth, so the row abutting it can be what sets the corner size.",
@@ -1126,6 +1127,21 @@ fn rdl_route(args: &[String]) -> ExitCode {
     };
     let allow45 = opts.get("allow45").is_some();
 
+    // ⛔ **The access vias are not implemented, and are now refused rather than ignored.**
+    // `rdl_route -bump_via` / `-pad_via` name a tech via that the reference builds at every bump
+    // or pad terminal (PAD-107/108 if it is missing), which also puts the via's own enclosure into
+    // the obstruction set (`populateObstructions`' last block). This engine routes on one layer
+    // and builds neither.
+    if let Some(code) = refuse_unimplemented(
+        &opts,
+        &[
+            ("bump-via", "an access via at each bump terminal; this engine routes on one layer"),
+            ("pad-via", "an access via at each pad terminal; this engine routes on one layer"),
+        ],
+    ) {
+        return code;
+    }
+
     let layer = opts.get("layer").unwrap_or_default().to_string();
     let width = opts.get("width").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let spacing = opts.get("spacing").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
@@ -1664,8 +1680,19 @@ fn assign_io_bump(args: &[String]) -> ExitCode {
         }
     };
 
-    // ⚠️ `-dont_route` and `-terminal` are mutually exclusive in the reference, and both only feed
-    // the RDL router's map. With no router here, `--dont-route` records intent and changes nothing.
+    // ⚠️ `-dont_route` and `-terminal` are mutually exclusive in the reference, and both feed
+    // `ICeWall::routing_map_` — which is a MEMBER OF THE COMMAND OBJECT, not database state.
+    //
+    // ⛔ **An earlier version of this comment said "with no router here, `--dont-route` records
+    // intent and changes nothing". There is a router here now** (`rdl-route`), and the second half
+    // is still true only of the DATABASE: upstream's `-dont_route` writes nothing either, so this
+    // command is faithful. What it cannot do is carry the intent forward, because every command
+    // here is a separate process and the database is the only channel there is.
+    //
+    // ⚠️ So `rdl-route` will route a bump upstream would have left alone — measured on
+    // `rdl_route_assignments`, 43 attempts against the reference's 34 in one process. Upstream has
+    // the same hole across its own `write_db`, which is why this is declared in the descriptor
+    // rather than refused: refusing it would fail cases where the database effect really is nil.
     if opts.get("dont-route").is_some() && terminal.is_some() {
         eprintln!("vyges-pad: --dont-route and --terminal cannot be used together");
         return ExitCode::from(2);
@@ -2144,6 +2171,24 @@ fn connect_ring(args: &[String]) -> ExitCode {
 /// A caller can then tell a feature that is missing from a design that is wrong — a distinction
 /// worth an exit code, because the two want opposite responses.
 const UNSUPPORTED: &str = "not implemented: ";
+
+/// **X1** — refuse an option the reference has and this engine does not, **by name**.
+///
+/// ⛔ [`parse_opts`] accepts ANY `--option value` as a key/value pair and never checks that
+/// anything reads it, so an option nobody implements is stored, ignored, and the command reports
+/// success. Asking `rdl-route` for `--pad-via` produced a route with no via, no warning and
+/// exit 0 — neither a refusal nor a declared limit.
+///
+/// 🔑 The rule: **honour it or refuse it, never answer differently in silence.** Exit 3, so a
+/// caller can tell a missing feature from a broken design.
+fn refuse_unimplemented(opts: &Opts, unimplemented: &[(&str, &str)]) -> Option<ExitCode> {
+    for (name, why) in unimplemented {
+        if opts.get(name).is_some() {
+            return Some(unsupported_or_error(&format!("{UNSUPPORTED}--{name}: {why}")));
+        }
+    }
+    None
+}
 
 fn unsupported_or_error(message: &str) -> ExitCode {
     eprintln!("vyges-pad: {message}");
@@ -3018,6 +3063,21 @@ mod tests {
     }
 
     #[test]
+    fn an_option_this_engine_does_not_implement_is_refused_not_ignored() {
+        // ⛔ `parse_opts` stores ANY `--option value`, so an unimplemented one used to be accepted
+        // and never read: `rdl_route --pad-via via9_0` returned a route with no via and exit 0.
+        let unimpl = [("pad-via", "an access via at each pad terminal")];
+        let given = parse_opts(&["d.odb", "--pad-via", "via9_0"].map(String::from)).unwrap();
+        assert!(
+            refuse_unimplemented(&given, &unimpl).is_some(),
+            "an unimplemented option must be refused, not stored and ignored"
+        );
+        // ⚠️ And it must refuse only what it names — otherwise every command loses its options.
+        let clean = parse_opts(&["d.odb", "--layer", "metal10"].map(String::from)).unwrap();
+        assert!(refuse_unimplemented(&clean, &unimpl).is_none());
+    }
+
+    #[test]
     fn the_descriptor_is_valid_json_and_states_what_is_out_of_scope() {
         let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("valid JSON");
         assert_eq!(d["name"], "pad");
@@ -3063,6 +3123,31 @@ mod tests {
 #[cfg(test)]
 mod pin_tests {
     use super::{describe, PIN_TOKEN};
+
+    #[test]
+    fn the_descriptor_names_what_this_engine_does_NOT_have() {
+        // ⛔ The SCOPE line lists what exists and is silent about what does not — which is how it
+        // came to be true and useless at the same time. This pins the other side: every command
+        // and option upstream has that we do not must be named, or this fails.
+        let d: serde_json::Value = serde_json::from_str(&describe()).expect("valid JSON");
+        let limits: Vec<String> = d["provenance_limitations"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        let absence = limits
+            .iter()
+            .find(|t| t.starts_with("ABSENCE"))
+            .expect("the descriptor must carry an ABSENCE limitation, not only a SCOPE one");
+        for missing in ["make_fake_io_site", "remove_io_rows", "--bump-via", "--pad-via",
+                        "--dont-route"] {
+            assert!(
+                absence.contains(missing),
+                "the descriptor does not say that {missing} is missing or unhonoured"
+            );
+        }
+    }
 
     #[test]
     fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
