@@ -1092,7 +1092,8 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut ties = 0usize;
         for (i, n) in nets.iter().enumerate() {
             let targets = rdl_targets(&db, n, &layer, to_dbu(width));
-            // One destination per terminal, at its first target's centre.
+            // One Dest per terminal for the ORDERING question, which is about terminals rather
+            // than targets; the router itself keeps every target (see `access`).
             let mut seen = std::collections::BTreeSet::new();
             let mut dests = Vec::new();
             for t in &targets {
@@ -1123,10 +1124,14 @@ fn rdl_route(args: &[String]) -> ExitCode {
                     id: iterm_id,
                 });
             }
-            for d in dests.clone() {
-                if !d.cover {
-                    continue;
-                }
+            // ⚠️ **The same two rules the router itself applies** — segments declared in ascending
+            // iterm id, and the last one dropped on a net of nothing but bumps. This block builds
+            // its own route list, so without them it reports an order the router does not use, and
+            // the drift is silent: the report keeps printing and stops describing anything.
+            let net_first = routes.len();
+            let mut cover: Vec<rdl::Dest> = dests.iter().filter(|d| d.cover).cloned().collect();
+            cover.sort_by_key(|d| d.id);
+            for d in cover {
                 let ordered = rdl::order_dests(&d.instance, d.centre, &dests);
                 if ordered.is_empty() {
                     continue;
@@ -1143,6 +1148,11 @@ fn rdl_route(args: &[String]) -> ExitCode {
                     pending: true,
                     points: Vec::new(),
                 });
+            }
+            let has_non_cover =
+                routes[net_first..].iter().any(|r| r.dests.iter().any(|d| !d.cover));
+            if !has_non_cover && routes.len() > net_first {
+                routes.pop();
             }
         }
         // ⚠️ Count ties on the DISTANCE, not on the comparator's result. `precedes` settles a
@@ -1211,7 +1221,9 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 access: Vec::new(),
             };
             let snaps = rdl::access_points(&g, &t, &obstructions, &own);
-            rdl::insert_access(&mut graph, &g, centre, &snaps, allow45);
+            rdl::insert_access(&mut graph, &g, centre, &snaps, allow45, &|a, b| {
+                rdl::blocked(a, b, &obstructions)
+            });
         }
         let path = rdl::shortest_path(&graph, (sx, sy), (tx, ty), turn);
         println!("{{\"segments\": {}}}", path.len());
@@ -1440,6 +1452,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             max_iters,
             opts.get("rebuild-each").map(|_| clear.as_slice()),
             allow45,
+            &|a, b| rdl::blocked(a, b, &obstructions),
         );
 
     if !opts.dry_run {
@@ -1491,7 +1504,9 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let body: String = done
             .log
             .iter()
-            .map(|(s, t, n)| format!("{} {} {} {} {n}\n", s.0, s.1, t.0, t.1))
+            .map(|(src, dst, s, t, n)| {
+                format!("{src} -> {dst} ({} {}) ({} {}) {n}\n", s.0, s.1, t.0, t.1)
+            })
             .collect();
         if let Err(e) = std::fs::write(path, body) {
             eprintln!("vyges-pad: cannot write {path}: {e}");

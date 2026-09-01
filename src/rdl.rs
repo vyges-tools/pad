@@ -413,6 +413,12 @@ pub fn insert_access(
     centre: Point,
     snaps: &[Point],
     allow45: bool,
+    // ⛔ **The snap-to-neighbour edges are obstruction-checked; the snap-to-CENTRE edge is not.**
+    // `addGraphEdge(snap, target.center, 1.0, false)` passes `check_obstructions = false` — the
+    // terminal's own metal must not block its own access — while `addGraphEdge(snap, pt)` for each
+    // collinear neighbour takes the default and IS checked. Joining both unconditionally hands the
+    // router access edges the reference refuses, and it then reaches places the reference cannot.
+    obstructed: &dyn Fn(Point, Point) -> bool,
 ) -> Undo {
     let mut undo = Undo::default();
     let c = graph.vertex(centre);
@@ -445,7 +451,11 @@ pub fn insert_access(
         graph.join(sv, c, w);
         undo.cut.push((sv, c));
         for &e in &ends {
-            let w = edge_weight(snap, graph.points[e], 1.0);
+            let pt_e = graph.points[e];
+            if obstructed(snap, pt_e) {
+                continue;
+            }
+            let w = edge_weight(snap, pt_e, 1.0);
             graph.join(sv, e, w);
             undo.cut.push((sv, e));
 
@@ -900,8 +910,9 @@ pub fn shortest_path(
 
     dist[s] = 0;
     prev[s] = s;
-    // Ordered by (f, vertex) with the sign flipped, so the smallest f leaves first and equal
-    // costs are settled by vertex number rather than by whichever happened to be pushed first.
+    // ⚠️ **Ordered by f ALONE**, as the reference's queue is — see `CostHeap`. An earlier comment
+    // here claimed the vertex number was a secondary key; it never was, and the heap ignores it.
+    // Adding it would give a different deterministic order and a different equal-cost path.
     heap.push((heuristic(s, &prev), s));
 
     while let Some((_, u)) = heap.pop() {
@@ -1198,9 +1209,13 @@ pub fn commit_corridor(route: &[Point], width: i32, spacing: i32) -> Vec<Rect> {
 pub struct Routed {
     /// `(net, source terminal, destination terminal, path)` for every route that connected.
     pub paths: Vec<(String, String, String, Vec<Point>)>,
-    /// Every attempt in order: `(source centre, destination centre, path length)`. A length of
-    /// zero is an attempt that found nothing.
-    pub log: Vec<(Point, Point, usize)>,
+    /// Every attempt in order: `(source terminal, destination terminal, source centre,
+    /// destination centre, path length)`. A length of zero is an attempt that found nothing.
+    ///
+    /// ⚠️ The TERMINALS are here so this can be diffed against the reference's own
+    /// `Routing {src} -> {dst}` debug line. Centres alone cannot be: with several targets per
+    /// terminal the same pair is attempted from different points.
+    pub log: Vec<(String, String, Point, Point, usize)>,
     pub attempts: usize,
     pub iterations: i32,
     pub failed: Vec<String>,
@@ -1249,6 +1264,7 @@ pub fn route_all(
     max_iterations: i32,
     rebuild: Option<&[(Point, Point)]>,
     allow45: bool,
+    obstructed: &dyn Fn(Point, Point) -> bool,
 ) -> Routed {
     let mut out = Routed::default();
     let mut committed: Vec<Option<Undo>> = vec![None; routes.len()];
@@ -1339,10 +1355,16 @@ pub fn route_all(
                         .collect()
                 };
                 let (src_open, dst_open) = (open(s_snaps), open(d_snaps));
-                let a = insert_access(graph, grid, *s_centre, &src_open, allow45);
-                let b = insert_access(graph, grid, *d_centre, &dst_open, allow45);
+                let a = insert_access(graph, grid, *s_centre, &src_open, allow45, obstructed);
+                let b = insert_access(graph, grid, *d_centre, &dst_open, allow45, obstructed);
                 let path = shortest_path(graph, *s_centre, *d_centre, turn_penalty);
-                out.log.push((*s_centre, *d_centre, path.len()));
+                out.log.push((
+                    routes[i].source.clone(),
+                    d.terminal.clone(),
+                    *s_centre,
+                    *d_centre,
+                    path.len(),
+                ));
 
                 if path.is_empty() {
                     graph.undo(&b);
@@ -1817,11 +1839,11 @@ mod tests {
 
         let mut kept = build();
         let before = kept.adj[kept.index[&(200, 200)]].len();
-        insert_access(&mut kept, &g, centre, &[snap], false);
+        insert_access(&mut kept, &g, centre, &[snap], false, &|_, _| false);
         let without_prune = kept.adj[kept.index[&(200, 200)]].len();
 
         let mut pruned = build();
-        insert_access(&mut pruned, &g, centre, &[snap], true);
+        insert_access(&mut pruned, &g, centre, &[snap], true, &|_, _| false);
         let with_prune = pruned.adj[pruned.index[&(200, 200)]].len();
 
         assert!(before > 0, "the fixture has edges to prune");
@@ -1847,11 +1869,11 @@ mod tests {
         // the whole test with the x rule passed every other test in this suite.
         let (centre_y, snap_y) = ((250, 150), (200, 150));
         let mut y_kept = build();
-        insert_access(&mut y_kept, &g, centre_y, &[snap_y], false);
+        insert_access(&mut y_kept, &g, centre_y, &[snap_y], false, &|_, _| false);
         let y_without = y_kept.adj[y_kept.index[&(200, 200)]].len();
 
         let mut y_pruned = build();
-        insert_access(&mut y_pruned, &g, centre_y, &[snap_y], true);
+        insert_access(&mut y_pruned, &g, centre_y, &[snap_y], true, &|_, _| false);
         let y_with = y_pruned.adj[y_pruned.index[&(200, 200)]].len();
         assert!(
             y_with < y_without,
@@ -2277,7 +2299,7 @@ mod write_order_tests {
         access.insert("C/p".into(), ("N1".into(), vec![((10, 0), vec![(10, 0)])]));
         access.insert("D/p".into(), ("N1".into(), vec![((20, 0), vec![(20, 0)])]));
 
-        let out = route_all(&mut graph, &grid, &mut routes, &access, 8, 4, 0.0, 1, None, false);
+        let out = route_all(&mut graph, &grid, &mut routes, &access, 8, 4, 0.0, 1, None, false, &|_, _| false);
         let sources: Vec<&str> = out.paths.iter().map(|(_, s, _, _)| s.as_str()).collect();
         assert_eq!(sources, vec!["C/p"], "only the route that connected is emitted");
         assert_eq!(out.failed, vec!["A/p".to_string()]);
@@ -2303,7 +2325,7 @@ mod write_order_tests {
         access.insert("X/p".into(), ("N1".into(), vec![((100, 0), vec![(100, 0)])]));
         access.insert("B/p".into(), ("N1".into(), vec![((30, 0), vec![(30, 0)])]));
 
-        let out = route_all(&mut graph, &grid, &mut routes, &access, 2, 0, 0.0, 10, None, false);
+        let out = route_all(&mut graph, &grid, &mut routes, &access, 2, 0, 0.0, 10, None, false, &|_, _| false);
         let dests: Vec<&str> = out.paths.iter().map(|(_, _, d, _)| d.as_str()).collect();
         assert_eq!(dests, vec!["B/p"], "X/p was unreachable, so B/p is what connected");
     }
@@ -2344,7 +2366,7 @@ mod write_order_tests {
         access.insert("D/p".into(), ("N2".into(), vec![((30, 1000), vec![(30, 1000)])]));
         // Its own access points are grid corners with no path between them.
 
-        let out = route_all(&mut graph, &grid, &mut routes, &access, 2, 0, 0.0, 10, None, false);
+        let out = route_all(&mut graph, &grid, &mut routes, &access, 2, 0, 0.0, 10, None, false, &|_, _| false);
 
         let sources: Vec<&str> = out.paths.iter().map(|(_, s, _, _)| s.as_str()).collect();
         assert_eq!(
@@ -2353,7 +2375,11 @@ mod write_order_tests {
             "emitted in route-list order even though C/p routed first"
         );
         // …and the attempt log proves the two orders really did disagree.
-        assert_eq!(out.log.first().map(|(s, _, _)| *s), Some((0, 1000)), "C/p was attempted first");
+        assert_eq!(
+            out.log.first().map(|(src, ..)| src.as_str()),
+            Some("C/p"),
+            "C/p was attempted first"
+        );
     }
 }
 
