@@ -846,17 +846,71 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
 ///
 /// One target per pin rectangle on the routing layer, on every **placed** instance the net
 /// touches. ⚠️ Unplaced instances are skipped rather than routed to where they are not.
-fn rdl_targets(db: &Db, net: &str, layer: &str) -> Vec<rdl::Target> {
+///
+/// 🔑 **A POLYGON port is not a rectangle and is not treated as one.** The reference reads the two
+/// forms through separate calls — `getPolygonGeometry()` then `getGeometry(false)` — and gives them
+/// different rules:
+///
+/// - a **rectangle** contributes one target: the whole box;
+/// - a **polygon** is first shrunk by half the wire width, and then contributes one small target
+///   square, of side `width/2`, at the midpoint of each of its **axis-aligned edges only**. Only
+///   if the shrunken polygon has no axis-aligned edge at all does every edge contribute one.
+///
+/// ⛔ Reading a polygon as its enclosing rectangle, or letting `getGeometry()` decompose it into
+/// rectangles (which is that call's default), both give a wrong answer with no error: an octagonal
+/// bump pad has four targets on its flat sides, not one in its middle and not a staircase.
+fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> {
     let mut out = Vec::new();
     for iterm in db.net_get_i_terms(net) {
         let Some((inst, term)) = iterm.rsplit_once('/') else { continue };
         if !db.inst_is_placed(inst) {
             continue;
         }
+        let first = out.len();
         let master = db.inst_get_master(inst);
         let orient = Orient::parse(&db.inst_get_orient(inst)).unwrap_or(Orient::R0);
         let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
-        for (l, x0, y0, x1, y1) in db.mterm_pin_boxes(&master, term).unwrap_or_default() {
+
+        // ⚠️ Polygons first, matching the reference's call order. The points come back already
+        // through the instance transform, and the shrink happens after it, not before.
+        for (l, pts) in db.iterm_pin_polygons(&iterm).unwrap_or_default() {
+            if db.layer_name_by_number(l) != layer {
+                continue;
+            }
+            let small = db.polygon_bloat(&pts, -width / 2).unwrap_or_default();
+            // ⚠️ `(a + b) / 2` and `width / 4` are integer divisions that truncate toward zero,
+            // as they do in the reference. Rounding either changes the target centres.
+            let make_rect = |p0: (i32, i32), p1: (i32, i32)| -> (i32, i32, i32, i32) {
+                let c = ((p0.0 + p1.0) / 2, (p0.1 + p1.1) / 2);
+                (c.0 - width / 4, c.1 - width / 4, c.0 + width / 4, c.1 + width / 4)
+            };
+            let mut push = |shape: (i32, i32, i32, i32)| {
+                out.push(rdl::Target {
+                    terminal: iterm.clone(),
+                    centre: ((shape.0 + shape.2) / 2, (shape.1 + shape.3) / 2),
+                    shape,
+                    access: Vec::new(),
+                });
+            };
+            let mut added = false;
+            for w in small.windows(2) {
+                if w[0].0 == w[1].0 || w[0].1 == w[1].1 {
+                    push(make_rect(w[0], w[1]));
+                    added = true;
+                }
+            }
+            if !added {
+                for w in small.windows(2) {
+                    push(make_rect(w[0], w[1]));
+                }
+            }
+        }
+
+        // ⛔ …and then the rectangles, **excluding** the ones a polygon decomposes into. Taking
+        // the default here would report every polygon twice, once in each form.
+        for (l, x0, y0, x1, y1) in
+            db.mterm_pin_boxes_excluding_polygons(&master, term).unwrap_or_default()
+        {
             if db.layer_name_by_number(l) != layer {
                 continue;
             }
@@ -868,6 +922,11 @@ fn rdl_targets(db: &Db, net: &str, layer: &str) -> Vec<rdl::Target> {
                 access: Vec::new(),
             });
         }
+
+        // 🔑 Per terminal, targets are sorted by centre then by shape — `compareRouteTargets`. With
+        // one target per terminal the order was moot; with four on a bump pad it decides which
+        // access point the router reaches for first.
+        out[first..].sort_by_key(|t| (t.centre.0, t.centre.1, t.shape.0, t.shape.1, t.shape.2, t.shape.3));
     }
     out
 }
@@ -993,7 +1052,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let mut target_report = String::new();
     let mut total_targets = 0usize;
     for n in &nets {
-        let t = rdl_targets(&db, n, &layer);
+        let t = rdl_targets(&db, n, &layer, to_dbu(width));
         let iterms: std::collections::BTreeSet<&String> =
             t.iter().map(|x| &x.terminal).collect();
         total_targets += t.len();
@@ -1004,7 +1063,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut routes: Vec<rdl::Route> = Vec::new();
         let mut ties = 0usize;
         for (i, n) in nets.iter().enumerate() {
-            let targets = rdl_targets(&db, n, &layer);
+            let targets = rdl_targets(&db, n, &layer, to_dbu(width));
             // One destination per terminal, at its first target's centre.
             let mut seen = std::collections::BTreeSet::new();
             let mut dests = Vec::new();
@@ -1080,7 +1139,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         // The reference logs TARGET centres, so report those rather than the ordering centres.
         let target_of: std::collections::HashMap<String, (i32, i32)> = nets
             .iter()
-            .flat_map(|n| rdl_targets(&db, n, &layer))
+            .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width)))
             .map(|t| (t.terminal, t.centre))
             .collect();
         let body: String = routes
@@ -1132,7 +1191,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             // The pin rectangles the two ends land on, so the end runs can reach into them.
             let shape_of = |c: (i32, i32)| {
                 nets.iter()
-                    .flat_map(|n| rdl_targets(&db, n, &layer))
+                    .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width)))
                     .find(|t| t.centre == c)
                     .map(|t| t.shape)
                     .unwrap_or((c.0, c.1, c.0, c.1))
@@ -1154,7 +1213,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     if let Some(path) = opts.get("net-centre-report") {
         let mut body = String::new();
         for n in &nets {
-            for t in rdl_targets(&db, n, &layer) {
+            for t in rdl_targets(&db, n, &layer, to_dbu(width)) {
                 body.push_str(&format!("{n} {} {} {}\n", t.centre.0, t.centre.1, t.terminal));
             }
         }
@@ -1166,7 +1225,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     if let Some(path) = opts.get("centre-report") {
         let mut all = std::collections::BTreeSet::new();
         for n in &nets {
-            for t in rdl_targets(&db, n, &layer) {
+            for t in rdl_targets(&db, n, &layer, to_dbu(width)) {
                 all.insert(t.centre);
             }
         }
@@ -1222,7 +1281,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let mut routes: Vec<rdl::Route> = Vec::new();
 
     for n in &nets {
-        let targets = rdl_targets(&db, n, &layer);
+        let targets = rdl_targets(&db, n, &layer, to_dbu(width));
         let mut dests: Vec<rdl::Dest> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for t in &targets {
