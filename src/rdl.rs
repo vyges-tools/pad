@@ -1304,7 +1304,7 @@ pub fn route_all(
             };
             routes[i].routed = true;
             routes[i].points = path.clone();
-            out.paths.push((src.0.clone(), routes[i].source.clone(), d.terminal.clone(), path));
+            let _ = &d;
         }
 
         out.iterations += 1;
@@ -1339,7 +1339,6 @@ pub fn route_all(
             routes[t].points.clear();
             routes[t].next = 0;
             routes[t].pending = true;
-            out.paths.retain(|(_, s, _, _)| *s != routes[t].source);
             queue.push(t);
         }
         for &f in &failed {
@@ -1352,6 +1351,27 @@ pub fn route_all(
             break;
         }
     }
+    // 🔑 **Written in the order the segments were DECLARED, not the order they routed.**
+    // Nothing upstream ever reorders `RDLNet::segments_`: the priority queue decides *when* a
+    // segment is attempted, and `writeToDb` is then reached by walking `routes_` and each net's
+    // `getSegments()` in the order `buildIntialRouteSet` added them. Emitting as routes complete
+    // gives the same wires in a different sequence — an identical set, resequenced.
+    //
+    // ⚠️ Only meaningful together with the declaration order itself: the callers build one route
+    // per COVER terminal in ascending iterm id, which is what `odb::PtrMap` iteration gives.
+    //
+    // ⚠️ The destination is the one at `next - 1`. The candidate loop advances `next` past every
+    // destination it skipped, so the last one it stepped over is the one that routed — the same
+    // index the served/reversed checks read.
+    out.paths = routes
+        .iter()
+        .filter(|r| r.routed)
+        .filter_map(|r| {
+            let d = r.dests.get(r.next.checked_sub(1)?)?;
+            let net = access.get(&r.source)?.0.clone();
+            Some((net, r.source.clone(), d.terminal.clone(), r.points.clone()))
+        })
+        .collect();
     out.failed = routes.iter().filter(|r| !r.routed).map(|r| r.source.clone()).collect();
     out
 }
@@ -2143,5 +2163,131 @@ mod multi_target_tests {
         // sqrt(98) = 9.899… also truncates to 9, so (7,7) ties with (9,4) — and beats (10,0).
         assert_eq!(distance((0, 0), (7, 7)), 9);
         assert_eq!(target_pairs(&src, &dst), vec![(0, 1), (0, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod write_order_tests {
+    use super::*;
+
+    fn dest(term: &str, at: Point, id: u64) -> Dest {
+        Dest { terminal: term.into(), instance: term.into(), centre: at, cover: false, id }
+    }
+
+    fn route(src: &str, at: Point, to: Dest, id: u64) -> Route {
+        Route {
+            source: src.into(),
+            instance: src.into(),
+            centre: at,
+            id,
+            dests: vec![to],
+            next: 0,
+            priority: 0,
+            routed: false,
+            pending: true,
+            points: Vec::new(),
+        }
+    }
+
+    // ⚠️ A route that never connected contributes NOTHING. Upstream guards the write with
+    // `if (segment->isRouted())`, so a failed segment is skipped rather than emitted with an empty
+    // path — and the surviving entries keep their list order rather than closing up by completion.
+    #[test]
+    fn a_route_that_failed_is_not_emitted() {
+        // One corridor. Whichever route commits first takes the middle out from under the other.
+        let grid = Grid { x: vec![0, 10, 20, 30], y: vec![0] };
+        let edges = vec![((0, 0), (10, 0)), ((10, 0), (20, 0)), ((20, 0), (30, 0))];
+        let mut graph = Graph::build(&grid, &edges, 1.0);
+
+        let mut routes = vec![
+            route("A/p", (0, 0), dest("B/p", (30, 0), 2), 1),
+            route("C/p", (10, 0), dest("D/p", (20, 0), 4), 3),
+        ];
+        routes[1].priority = 10; // C/p goes first and blocks the corridor
+
+        let mut access: std::collections::HashMap<String, (String, Vec<(Point, Vec<Point>)>)> =
+            Default::default();
+        access.insert("A/p".into(), ("N1".into(), vec![((0, 0), vec![(0, 0)])]));
+        access.insert("B/p".into(), ("N1".into(), vec![((30, 0), vec![(30, 0)])]));
+        access.insert("C/p".into(), ("N1".into(), vec![((10, 0), vec![(10, 0)])]));
+        access.insert("D/p".into(), ("N1".into(), vec![((20, 0), vec![(20, 0)])]));
+
+        let out = route_all(&mut graph, &grid, &mut routes, &access, 8, 4, 0.0, 1, None, false);
+        let sources: Vec<&str> = out.paths.iter().map(|(_, s, _, _)| s.as_str()).collect();
+        assert_eq!(sources, vec!["C/p"], "only the route that connected is emitted");
+        assert_eq!(out.failed, vec!["A/p".to_string()]);
+    }
+
+    // ⚠️ The destination recorded is the one that actually connected, not the first candidate.
+    // It decides which pin shape the wire is clipped against at the write, so taking `dests[0]`
+    // when the router fell through to `dests[1]` clips against the wrong pin.
+    #[test]
+    fn the_destination_recorded_is_the_one_that_connected() {
+        // A reachable corridor 0..30, plus an isolated vertex at 100 that nothing can reach.
+        let grid = Grid { x: vec![0, 10, 20, 30, 100], y: vec![0] };
+        let edges = vec![((0, 0), (10, 0)), ((10, 0), (20, 0)), ((20, 0), (30, 0))];
+        let mut graph = Graph::build(&grid, &edges, 1.0);
+
+        let mut r = route("A/p", (0, 0), dest("X/p", (100, 0), 2), 1);
+        r.dests.push(dest("B/p", (30, 0), 4)); // tried only after X/p fails
+        let mut routes = vec![r];
+
+        let mut access: std::collections::HashMap<String, (String, Vec<(Point, Vec<Point>)>)> =
+            Default::default();
+        access.insert("A/p".into(), ("N1".into(), vec![((0, 0), vec![(0, 0)])]));
+        access.insert("X/p".into(), ("N1".into(), vec![((100, 0), vec![(100, 0)])]));
+        access.insert("B/p".into(), ("N1".into(), vec![((30, 0), vec![(30, 0)])]));
+
+        let out = route_all(&mut graph, &grid, &mut routes, &access, 2, 0, 0.0, 10, None, false);
+        let dests: Vec<&str> = out.paths.iter().map(|(_, _, d, _)| d.as_str()).collect();
+        assert_eq!(dests, vec!["B/p"], "X/p was unreachable, so B/p is what connected");
+    }
+
+    // 🔑 Upstream rule: nothing ever reorders `RDLNet::segments_`. The priority queue decides
+    // WHEN a segment is attempted; `writeToDb` is reached by walking each net's `getSegments()`
+    // in the order `buildIntialRouteSet` added them. So the emitted order must follow the route
+    // list, not the order routes happened to complete.
+    //
+    // ⚠️ This test is built so the two orders DISAGREE: route 1 is given a higher priority than
+    // route 0, so it is attempted first and completes first.
+    #[test]
+    fn routes_are_emitted_in_list_order_not_completion_order() {
+        // Two independent corridors, far enough apart not to interact.
+        let grid = Grid { x: vec![0, 10, 20, 30], y: vec![0, 1000] };
+        let edges = vec![
+            ((0, 0), (10, 0)),
+            ((10, 0), (20, 0)),
+            ((20, 0), (30, 0)),
+            ((0, 1000), (10, 1000)),
+            ((10, 1000), (20, 1000)),
+            ((20, 1000), (30, 1000)),
+        ];
+        let mut graph = Graph::build(&grid, &edges, 1.0);
+
+        let mut routes = vec![
+            route("A/p", (0, 0), dest("B/p", (30, 0), 2), 1),
+            route("C/p", (0, 1000), dest("D/p", (30, 1000), 4), 3),
+        ];
+        // Route 1 is attempted first — `precedes` puts the higher priority at the front.
+        routes[1].priority = 10;
+
+        let mut access: std::collections::HashMap<String, (String, Vec<(Point, Vec<Point>)>)> =
+            Default::default();
+        access.insert("A/p".into(), ("N1".into(), vec![((0, 0), vec![(0, 0)])]));
+        access.insert("B/p".into(), ("N1".into(), vec![((30, 0), vec![(30, 0)])]));
+        access.insert("C/p".into(), ("N2".into(), vec![((0, 1000), vec![(0, 1000)])]));
+        access.insert("D/p".into(), ("N2".into(), vec![((30, 1000), vec![(30, 1000)])]));
+        // Its own access points are grid corners with no path between them.
+
+        let out = route_all(&mut graph, &grid, &mut routes, &access, 2, 0, 0.0, 10, None, false);
+
+        let sources: Vec<&str> = out.paths.iter().map(|(_, s, _, _)| s.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["A/p", "C/p"],
+            "emitted in route-list order even though C/p routed first"
+        );
+        // …and the attempt log proves the two orders really did disagree.
+        assert_eq!(out.log.first().map(|(s, _, _)| *s), Some((0, 1000)), "C/p was attempted first");
     }
 }

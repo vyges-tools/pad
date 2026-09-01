@@ -1366,7 +1366,14 @@ fn rdl_route(args: &[String]) -> ExitCode {
             targets.retain(|(_, snaps)| !snaps.is_empty());
         }
 
-        for d in dests.clone().into_iter().filter(|d| d.cover) {
+        // 🔑 **Segments are declared in ascending ITERM ID order.** `buildIntialRouteSet` walks
+        // `routing_targets_[net]`, an `odb::PtrMap` — which is a `std::map` keyed by
+        // `ODBPtrLess`, i.e. `compare_by_id`. Taking the net's terminals in database-list order
+        // instead gives the same segments in a different sequence, and since nothing ever
+        // reorders `RDLNet::segments_`, that sequence is what the DEF is written in.
+        let mut cover: Vec<rdl::Dest> = dests.iter().filter(|d| d.cover).cloned().collect();
+        cover.sort_by_key(|d| d.id);
+        for d in cover {
             let ordered = rdl::order_dests(&d.instance, d.centre, &dests);
             if ordered.is_empty() {
                 continue;
