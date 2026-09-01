@@ -968,11 +968,36 @@ pub fn shortest_path(
             return path;
         }
         for &(v, w) in &graph.adj[u] {
-            let candidate = dist[u].saturating_add(w);
-            if candidate < dist[v] {
-                dist[v] = candidate;
+            // ⛔ **`boost::relax` has a SECOND branch, and the graph is `undirectedS`.** When the
+            // forward relaxation fails it tries the edge the other way and may improve the vertex
+            // being EXPANDED, from its neighbour:
+            //
+            // ```text
+            // if (d[u] + w < d[v])            { d[v] = d[u]+w; p[v] = u; return true; }
+            // else if (is_undirected && d[v] + w < d[u]) { d[u] = d[v]+w; p[u] = v; return true; }
+            // ```
+            //
+            // ⚠️ Two consequences, both load-bearing. `p[u]` can change **mid-expansion**, and the
+            // heuristic reads `predecessor[predecessor[w]]` — so every later neighbour in this same
+            // out-edge loop is scored against a different incoming direction. And the caller pushes
+            // the TARGET either way (`w_rank = distance[w] + h(w)`), so the vertex that actually
+            // improved is not the one queued.
+            //
+            // ℹ️ The reverse branch cannot overflow: it is only reached when the forward test
+            // failed, which means `dist[v]` is already finite.
+            let decreased = if dist[u].saturating_add(w) < dist[v] {
+                dist[v] = dist[u].saturating_add(w);
                 prev[v] = u;
-                let f = candidate.saturating_add(heuristic(v, &prev));
+                true
+            } else if dist[v].saturating_add(w) < dist[u] {
+                dist[u] = dist[v].saturating_add(w);
+                prev[u] = v;
+                true
+            } else {
+                false
+            };
+            if decreased {
+                let f = dist[v].saturating_add(heuristic(v, &prev));
                 heap.push((f, v));
             }
         }
