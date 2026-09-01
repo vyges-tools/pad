@@ -1283,9 +1283,13 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let w = to_dbu(width);
     let sp = to_dbu(spacing);
 
-    let mut access: std::collections::HashMap<String, (rdl::Point, Vec<rdl::Point>, String)> =
+    // 🔑 Keyed by terminal, but holding **every** target it has — the reference searches the cross
+    // product of the two ends' targets, so all of them have to survive to the router.
+    let mut access: std::collections::HashMap<String, (String, Vec<(rdl::Point, Vec<rdl::Point>)>)> =
         std::collections::HashMap::new();
-    let mut shape_of: std::collections::HashMap<String, (i32, i32, i32, i32)> =
+    // ⚠️ Keyed by target CENTRE, not by terminal: with several targets on a pad, the shape a wire
+    // must be clipped against is the one belonging to the target the router actually reached.
+    let mut shape_of: std::collections::HashMap<rdl::Point, (i32, i32, i32, i32)> =
         std::collections::HashMap::new();
     let mut routes: Vec<rdl::Route> = Vec::new();
 
@@ -1294,25 +1298,40 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut dests: Vec<rdl::Dest> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for t in &targets {
-            if !seen.insert(t.terminal.clone()) {
-                continue;
-            }
             let (inst, pin) = t.terminal.rsplit_once('/').unwrap_or(("", ""));
             let (inst, pin) = (inst.to_string(), pin.to_string());
-            let bb = (
-                db.iterm_get_b_box_x_min(&inst, &pin),
-                db.iterm_get_b_box_y_min(&inst, &pin),
-                db.iterm_get_b_box_x_max(&inst, &pin),
-                db.iterm_get_b_box_y_max(&inst, &pin),
-            );
             let own: Vec<(i32, i32, i32, i32)> = obstructions
                 .iter()
                 .copied()
                 .filter(|r| rdl::hits(t.centre, t.centre, *r))
                 .collect();
             let snaps = rdl::access_points(&g, t, &obstructions, &own);
-            access.insert(t.terminal.clone(), (t.centre, snaps, n.clone()));
-            shape_of.insert(t.terminal.clone(), t.shape);
+            // ⛔ …and then the terminal's own DIAGONAL pin edges. An octagonal pad's access line
+            // may leave the target centre and cross a facet of the very pin it is reaching, which
+            // the reference removes; the axis-aligned edges are skipped explicitly.
+            let own_polygons: Vec<Vec<rdl::Point>> = db
+                .iterm_pin_polygons(&t.terminal)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(l, _)| db.layer_name_by_number(*l) == layer)
+                .map(|(_, pts)| pts)
+                .collect();
+            let snaps = rdl::snaps_clear_of_diagonal_pin_edges(t.centre, &snaps, &own_polygons);
+            access
+                .entry(t.terminal.clone())
+                .or_insert_with(|| (n.clone(), Vec::new()))
+                .1
+                .push((t.centre, snaps));
+            shape_of.insert(t.centre, t.shape);
+            if !seen.insert(t.terminal.clone()) {
+                continue;
+            }
+            let bb = (
+                db.iterm_get_b_box_x_min(&inst, &pin),
+                db.iterm_get_b_box_y_min(&inst, &pin),
+                db.iterm_get_b_box_x_max(&inst, &pin),
+                db.iterm_get_b_box_y_max(&inst, &pin),
+            );
             dests.push(rdl::Dest {
                 terminal: t.terminal.clone(),
                 instance: inst.clone(),
@@ -1321,6 +1340,32 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 id: db.iterm_id(&inst, &pin).unwrap_or(0) as u64,
             });
         }
+        // ⛔ **`cleanupTerminalAccessPoints`** — a snap point two of a terminal's own targets both
+        // claim is kept only on the target whose CENTRE is closest to it, and erased from the
+        // rest. A target left with no access point at all is then dropped entirely.
+        //
+        // ⚠️ The reference sorts the contenders by distance with a **stable** sort, so an exact tie
+        // keeps the target that was generated first — which, after `compareRouteTargets`, means the
+        // one lower in centre order.
+        for (_, targets) in access.values_mut() {
+            let mut claims: std::collections::BTreeMap<rdl::Point, Vec<usize>> = Default::default();
+            for (i, (_, snaps)) in targets.iter().enumerate() {
+                for &snap in snaps {
+                    claims.entry(snap).or_default().push(i);
+                }
+            }
+            for (snap, mut owners) in claims {
+                if owners.len() < 2 {
+                    continue;
+                }
+                owners.sort_by_key(|&i| rdl::distance(snap, targets[i].0));
+                for &loser in &owners[1..] {
+                    targets[loser].1.retain(|&p| p != snap);
+                }
+            }
+            targets.retain(|(_, snaps)| !snaps.is_empty());
+        }
+
         for d in dests.clone().into_iter().filter(|d| d.cover) {
             let ordered = rdl::order_dests(&d.instance, d.centre, &dests);
             if ordered.is_empty() {
@@ -1362,9 +1407,11 @@ fn rdl_route(args: &[String]) -> ExitCode {
             for net in done.paths.iter().map(|(n, ..)| n.clone()).collect::<std::collections::BTreeSet<_>>() {
                 db.clear_routed_swires(&net).map_err(|e| format!("{net}: {e}"))?;
             }
-            for (net, src, dst, path) in &done.paths {
-                let s = shape_of.get(src).copied().unwrap_or_default();
-                let t = shape_of.get(dst).copied().unwrap_or_default();
+            for (net, _src, _dst, path) in &done.paths {
+                // ⚠️ The shapes to clip against are the ones of the targets the router actually
+                // reached — the path's own endpoints — not the terminal's first target.
+                let s = path.first().and_then(|p| shape_of.get(p)).copied().unwrap_or_default();
+                let t = path.last().and_then(|p| shape_of.get(p)).copied().unwrap_or_default();
                 make_special(&mut db, net)?;
                 for piece in rdl::wires(path, w, s, t) {
                     // ⛔ **BOTH kinds, and a diagonal is not a rectangle.** The reference writes an

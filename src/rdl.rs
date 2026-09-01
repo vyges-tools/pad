@@ -488,30 +488,69 @@ pub fn edge_obstruction(p0: Point, p1: Point, dist: i32) -> Vec<Point> {
     pts
 }
 
-/// Does the segment `a`–`b` touch the closed ring `poly`?
+/// Do the two segments touch? Endpoints and collinear overlap count, as they do in
+/// `boost::geometry::intersects`.
 ///
-/// The ring is convex, so a segment misses it only when it misses every edge AND neither end is
-/// inside. Both tests are integer; nothing here rounds.
-pub fn segment_hits_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
+/// Integer throughout — the cross products are taken in `i64`, so nothing here rounds.
+pub fn segments_intersect(p1: Point, p2: Point, p3: Point, p4: Point) -> bool {
     let cross = |o: Point, p: Point, q: Point| -> i64 {
         (p.0 - o.0) as i64 * (q.1 - o.1) as i64 - (p.1 - o.1) as i64 * (q.0 - o.0) as i64
     };
     let on = |o: Point, p: Point, q: Point| -> bool {
         q.0.min(o.0) <= p.0 && p.0 <= q.0.max(o.0) && q.1.min(o.1) <= p.1 && p.1 <= q.1.max(o.1)
     };
-    let segs_cross = |p1: Point, p2: Point, p3: Point, p4: Point| -> bool {
-        let (d1, d2) = (cross(p3, p4, p1), cross(p3, p4, p2));
-        let (d3, d4) = (cross(p1, p2, p3), cross(p1, p2, p4));
-        if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
-            && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
-        {
-            return true;
-        }
-        (d1 == 0 && on(p3, p1, p4))
-            || (d2 == 0 && on(p3, p2, p4))
-            || (d3 == 0 && on(p1, p3, p2))
-            || (d4 == 0 && on(p1, p4, p2))
-    };
+    let (d1, d2) = (cross(p3, p4, p1), cross(p3, p4, p2));
+    let (d3, d4) = (cross(p1, p2, p3), cross(p1, p2, p4));
+    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+        return true;
+    }
+    (d1 == 0 && on(p3, p1, p4))
+        || (d2 == 0 && on(p3, p2, p4))
+        || (d3 == 0 && on(p1, p3, p2))
+        || (d4 == 0 && on(p1, p4, p2))
+}
+
+/// **G18** — an access line that crosses one of the terminal's own DIAGONAL pin edges is dropped.
+///
+/// 🔑 Upstream rule (the tail of `populateTerminalAccessPoints`): gather the terminal's polygon
+/// geometry on the target's layer, and for every candidate snap point test the line from the
+/// target centre against each polygon edge — **skipping the axis-aligned edges explicitly**. Every
+/// snap that crosses a diagonal edge is removed.
+///
+/// ⚠️ The comment above it upstream reads *"if at least one passes a non-rect edge, remove all
+/// violating points"*, which is looser than the code: there is no "at least one" condition, every
+/// violating point goes. ⚠️ The polygons are the RAW transformed pin shapes, not the shrunken ones
+/// target generation walks.
+pub fn snaps_clear_of_diagonal_pin_edges(
+    centre: Point,
+    snaps: &[Point],
+    polygons: &[Vec<Point>],
+) -> Vec<Point> {
+    if polygons.is_empty() {
+        return snaps.to_vec();
+    }
+    snaps
+        .iter()
+        .copied()
+        .filter(|&snap| {
+            !polygons.iter().any(|poly| {
+                poly.windows(2).any(|w| {
+                    if w[0].0 == w[1].0 || w[0].1 == w[1].1 {
+                        return false; // an axis-aligned pin edge is not a barrier
+                    }
+                    segments_intersect(centre, snap, w[0], w[1])
+                })
+            })
+        })
+        .collect()
+}
+
+/// Does the segment `a`–`b` touch the closed ring `poly`?
+///
+/// The ring is convex, so a segment misses it only when it misses every edge AND neither end is
+/// inside. Both tests are integer; nothing here rounds.
+pub fn segment_hits_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
+    let segs_cross = segments_intersect;
     for w in poly.windows(2) {
         if segs_cross(a, b, w[0], w[1]) {
             return true;
@@ -1111,7 +1150,9 @@ pub fn route_all(
     graph: &mut Graph,
     grid: &Grid,
     routes: &mut [Route],
-    access: &std::collections::HashMap<String, (Point, Vec<Point>, String)>,
+    // 🔑 Every target of a terminal, not just one: `(net, [(centre, access points)])`. The
+    // reference keeps a vector per iterm and searches the **cross product** of the two ends.
+    access: &std::collections::HashMap<String, (String, Vec<(Point, Vec<Point>)>)>,
     width: i32,
     spacing: i32,
     turn_penalty: f32,
@@ -1166,53 +1207,88 @@ pub fn route_all(
                 continue;
             };
             out.attempts += 1;
-            // ⚠️ An experiment, off by default: rebuild the graph from the original edge list and
-            // re-apply every committed corridor, so a vertex's edges sit in build order rather
-            // than in whatever order removing and restoring them has left. If the two runs differ,
-            // the accumulated order is what decides the remaining equal-cost choices.
-            if let Some(base) = rebuild {
-                *graph = Graph::build(grid, base, 1.0);
-                let laid_paths: Vec<Vec<Point>> =
-                    routes.iter().filter(|r| r.routed).map(|r| r.points.clone()).collect();
-                for pts in &laid_paths {
-                    commit_route(graph, pts, width, spacing, allow45);
-                }
-            }
-            // ⚠️ Filtered against what is already on the die, every time.
-            let laid: Vec<&[Point]> =
-                routes.iter().filter(|r| r.routed).map(|r| r.points.as_slice()).collect();
-            let open = |snaps: &[Point]| -> Vec<Point> {
-                snaps
-                    .iter()
-                    .copied()
-                    .filter(|&p| !access_blocked(p, &laid, width, spacing))
-                    .collect()
-            };
-            let (src_open, dst_open) = (open(&src.1), open(&dst.1));
-            let a = insert_access(graph, grid, src.0, &src_open, allow45);
-            let b = insert_access(graph, grid, dst.0, &dst_open, allow45);
-            let path = shortest_path(graph, src.0, dst.0, turn_penalty);
-            out.log.push((src.0, dst.0, path.len()));
+            // 🔑 **Every pairing of the two terminals' targets, in distance order.** A pad with
+            // several pin shapes — or one polygon pin, which yields a target per flat side — has
+            // more than one place a wire may land, and the reference tries them all: the cross
+            // product, `stable_sort`ed by centre-to-centre distance and then by the four centre
+            // coordinates, taking the FIRST pair that routes.
+            //
+            // ⛔ Collapsing a terminal to one target makes this loop a single attempt. It is
+            // invisible on a single-shape pin and decides the result on a bump pad.
+            let mut pairs: Vec<(usize, usize)> =
+                (0..src.1.len()).flat_map(|a| (0..dst.1.len()).map(move |b| (a, b))).collect();
+            pairs.sort_by(|&(la, lb), &(ra, rb)| {
+                let (l0, l1) = (src.1[la].0, dst.1[lb].0);
+                let (r0, r1) = (src.1[ra].0, dst.1[rb].0);
+                distance(l0, l1)
+                    .cmp(&distance(r0, r1))
+                    .then(l0.0.cmp(&r0.0))
+                    .then(l0.1.cmp(&r0.1))
+                    .then(l1.0.cmp(&r1.0))
+                    .then(l1.1.cmp(&r1.1))
+            });
 
-            if path.is_empty() {
+            let mut laid_path: Option<(Point, Point, Vec<Point>)> = None;
+            for (si, di) in pairs {
+                let (s_centre, s_snaps) = &src.1[si];
+                let (d_centre, d_snaps) = &dst.1[di];
+
+                // ⚠️ An experiment, off by default: rebuild the graph from the original edge list
+                // and re-apply every committed corridor, so a vertex's edges sit in build order
+                // rather than in whatever order removing and restoring them has left. If the two
+                // runs differ, the accumulated order is what decides the remaining equal-cost
+                // choices.
+                if let Some(base) = rebuild {
+                    *graph = Graph::build(grid, base, 1.0);
+                    let laid_paths: Vec<Vec<Point>> =
+                        routes.iter().filter(|r| r.routed).map(|r| r.points.clone()).collect();
+                    for pts in &laid_paths {
+                        commit_route(graph, pts, width, spacing, allow45);
+                    }
+                }
+                // ⚠️ Filtered against what is already on the die, **per attempt** — the reference
+                // calls `insertTerminalAccess` inside this loop, not once before it.
+                let laid: Vec<&[Point]> =
+                    routes.iter().filter(|r| r.routed).map(|r| r.points.as_slice()).collect();
+                let open = |snaps: &[Point]| -> Vec<Point> {
+                    snaps
+                        .iter()
+                        .copied()
+                        .filter(|&p| !access_blocked(p, &laid, width, spacing))
+                        .collect()
+                };
+                let (src_open, dst_open) = (open(s_snaps), open(d_snaps));
+                let a = insert_access(graph, grid, *s_centre, &src_open, allow45);
+                let b = insert_access(graph, grid, *d_centre, &dst_open, allow45);
+                let path = shortest_path(graph, *s_centre, *d_centre, turn_penalty);
+                out.log.push((*s_centre, *d_centre, path.len()));
+
+                if path.is_empty() {
+                    graph.undo(&b);
+                    graph.undo(&a);
+                    continue;
+                }
+                // ⚠️ The corridor is taken out **while the terminal access is still grafted on**,
+                // and only then is the access removed. The route's own access points are route
+                // vertices, so committing first removes the edges around them too; undoing the
+                // access first leaves those edges in place and the next route may run straight
+                // past a terminal another route is already using.
+                committed[i] = Some(commit_route(graph, &path, width, spacing, allow45));
                 graph.undo(&b);
                 graph.undo(&a);
+                laid_path = Some((*s_centre, *d_centre, path));
+                break;
+            }
+
+            let Some((_, _, path)) = laid_path else {
                 if routes[i].has_next() {
                     queue.push(i);
                 }
                 continue;
-            }
-            // ⚠️ The corridor is taken out **while the terminal access is still grafted on**, and
-            // only then is the access removed. The route's own access points are route vertices,
-            // so committing first removes the edges around them too; undoing the access first
-            // leaves those edges in place and the next route may run straight past a terminal
-            // another route is already using.
-            committed[i] = Some(commit_route(graph, &path, width, spacing, allow45));
-            graph.undo(&b);
-            graph.undo(&a);
+            };
             routes[i].routed = true;
             routes[i].points = path.clone();
-            out.paths.push((src.2.clone(), routes[i].source.clone(), d.terminal.clone(), path));
+            out.paths.push((src.0.clone(), routes[i].source.clone(), d.terminal.clone(), path));
         }
 
         out.iterations += 1;
