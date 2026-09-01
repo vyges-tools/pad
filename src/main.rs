@@ -1371,6 +1371,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         // `ODBPtrLess`, i.e. `compare_by_id`. Taking the net's terminals in database-list order
         // instead gives the same segments in a different sequence, and since nothing ever
         // reorders `RDLNet::segments_`, that sequence is what the DEF is written in.
+        let net_first = routes.len();
         let mut cover: Vec<rdl::Dest> = dests.iter().filter(|d| d.cover).cloned().collect();
         cover.sort_by_key(|d| d.id);
         for d in cover {
@@ -1390,6 +1391,20 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 pending: true,
                 points: Vec::new(),
             });
+        }
+        // ⛔ **`RDLNet::finalizeSegments` — a net of nothing but bumps routes N-1 segments.**
+        // If no segment has a non-cover destination, the LAST one is dropped outright, *"otherwise
+        // we route the same cover more than once"*. Keeping it does not add a wire: the duplicate
+        // is skipped as already-served, but it may be the one that routes FIRST, and the pair is
+        // then drawn from the other end — the same five wires in reverse. That is what
+        // `rdl_route_bump_to_bump_only` was showing on 14 of its 16 nets.
+        //
+        // ⚠️ The test is over each segment's DESTINATIONS, not its source, and the segment removed
+        // is the last declared — which, after the id sort above, is the highest iterm id.
+        let has_non_cover =
+            routes[net_first..].iter().any(|r| r.dests.iter().any(|d| !d.cover));
+        if !has_non_cover && routes.len() > net_first {
+            routes.pop();
         }
     }
 
