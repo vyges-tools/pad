@@ -1124,7 +1124,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 access: Vec::new(),
             };
             let snaps = rdl::access_points(&g, &t, &obstructions, &own);
-            rdl::insert_access(&mut graph, &g, centre, &snaps);
+            rdl::insert_access(&mut graph, &g, centre, &snaps, allow45);
         }
         let path = rdl::shortest_path(&graph, (sx, sy), (tx, ty), turn);
         println!("{{\"segments\": {}}}", path.len());
@@ -1285,6 +1285,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             turn,
             max_iters,
             opts.get("rebuild-each").map(|_| clear.as_slice()),
+            allow45,
         );
 
     if !opts.dry_run {
@@ -1298,9 +1299,27 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 let t = shape_of.get(dst).copied().unwrap_or_default();
                 make_special(&mut db, net)?;
                 for piece in rdl::wires(path, w, s, t) {
-                    if let rdl::Wire::Straight(r) = piece {
-                        db.add_swire_box(net, &layer, r, opts.get("fixed").is_some())
-                            .map_err(|e| format!("cannot write a wire on {net}: {e}"))?;
+                    // ⛔ **BOTH kinds, and a diagonal is not a rectangle.** The reference writes an
+                    // axis-aligned run as a bounding box and a 45 through a different
+                    // `dbSBox::create` overload taking the segment's two RAW ENDPOINTS plus the
+                    // width — the bbox it computes for the straight case is discarded on that
+                    // branch, and no end-point correction is applied (`RDLRouter::writeToDb`).
+                    //
+                    // ⚠️ This was `if let Wire::Straight(r)` with no else, so every diagonal fell
+                    // out silently: measured 2026-09-01, all five `-allow45` cases emitted ZERO
+                    // diagonal wires against the reference's 388 on `rdl_route_45` alone. The
+                    // straight pieces either side of a dropped diagonal do not meet, so the net
+                    // was left DISCONNECTED rather than merely short of metal.
+                    match piece {
+                        rdl::Wire::Straight(r) => db
+                            .add_swire_box(net, &layer, r, opts.get("fixed").is_some())
+                            .map_err(|e| format!("cannot write a wire on {net}: {e}"))?,
+                        rdl::Wire::Diagonal(a, b, dw) => db
+                            .add_swire_octilinear(
+                                net, &layer, a, b, dw,
+                                opts.get("fixed").is_some(), "IOWIRE",
+                            )
+                            .map_err(|e| format!("cannot write a 45 wire on {net}: {e}"))?,
                     }
                 }
             }

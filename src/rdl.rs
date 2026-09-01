@@ -337,7 +337,18 @@ impl Graph {
     }
 }
 
-pub fn insert_access(graph: &mut Graph, g: &Grid, centre: Point, snaps: &[Point]) -> Undo {
+/// ⛔ **`allow45` prunes ACUTE edges here, and the position in the sequence is the rule.** The
+/// reference does it inside the per-vertex loop and **after** `addGraphEdge(snap, pt)`, which is
+/// why it has to skip the edge it just added (`if (other_pt == snap) continue`). It iterates the
+/// edges of the GRID VERTEX, not of the snap, and every removal is recorded so the access can be
+/// undone when a route is ripped up.
+pub fn insert_access(
+    graph: &mut Graph,
+    g: &Grid,
+    centre: Point,
+    snaps: &[Point],
+    allow45: bool,
+) -> Undo {
     let mut undo = Undo::default();
     let c = graph.vertex(centre);
     for &snap in snaps {
@@ -372,6 +383,42 @@ pub fn insert_access(graph: &mut Graph, g: &Grid, centre: Point, snaps: &[Point]
             let w = edge_weight(snap, graph.points[e], 1.0);
             graph.join(sv, e, w);
             undo.cut.push((sv, e));
+
+            // ⛔ **The acute prune, in the reference's own position: after the join above.** A
+            // diagonal leaving this grid point in the SAME direction the access edge arrives from
+            // is a turn a wire cannot make, so the reference deletes it before any search runs.
+            //
+            // ⚠️ The axis test is not symmetric: `snap_dy == 0` compares x and EVERYTHING ELSE
+            // compares y, a diagonal snap included. Transcribed rather than tidied.
+            if allow45 {
+                let pt = graph.points[e];
+                let (snap_dx, snap_dy) = (pt.0 - snap.0, pt.1 - snap.1);
+                let doomed: Vec<usize> = graph.adj[e]
+                    .iter()
+                    .map(|&(o, _)| o)
+                    .filter(|&o| {
+                        let other = graph.points[o];
+                        if other == snap {
+                            return false;           // the edge just added
+                        }
+                        if pt.0 == other.0 || pt.1 == other.1 {
+                            return false;           // a right angle stays
+                        }
+                        let (edge_dx, edge_dy) = (pt.0 - other.0, pt.1 - other.1);
+                        if snap_dy == 0 {
+                            (snap_dx < 0 && edge_dx < 0) || (snap_dx > 0 && edge_dx > 0)
+                        } else {
+                            (snap_dy < 0 && edge_dy < 0) || (snap_dy > 0 && edge_dy > 0)
+                        }
+                    })
+                    .collect();
+                for o in doomed {
+                    if let Some(w) = graph.weight_between(e, o) {
+                        undo.restore.push((e, o, w));
+                    }
+                    graph.cut(e, o);
+                }
+            }
         }
     }
     undo
@@ -923,6 +970,7 @@ pub fn route_all(
     turn_penalty: f32,
     max_iterations: i32,
     rebuild: Option<&[(Point, Point)]>,
+    allow45: bool,
 ) -> Routed {
     let mut out = Routed::default();
     let mut committed: Vec<Option<Undo>> = vec![None; routes.len()];
@@ -994,8 +1042,8 @@ pub fn route_all(
                     .collect()
             };
             let (src_open, dst_open) = (open(&src.1), open(&dst.1));
-            let a = insert_access(graph, grid, src.0, &src_open);
-            let b = insert_access(graph, grid, dst.0, &dst_open);
+            let a = insert_access(graph, grid, src.0, &src_open, allow45);
+            let b = insert_access(graph, grid, dst.0, &dst_open, allow45);
             let path = shortest_path(graph, src.0, dst.0, turn_penalty);
             out.log.push((src.0, dst.0, path.len()));
 
@@ -1423,6 +1471,82 @@ mod tests {
         assert!(!pts.contains(&(100, 150)), "inside the pad, rejected as a candidate");
         assert!(!pts.contains(&(200, 150)), "likewise");
         assert!(pts.contains(&(0, 150)) && pts.contains(&(300, 150)), "the live tracks outside");
+    }
+
+    #[test]
+    /// ⛔ **The acute prune** — `insertTerminalAccess` under `allow45`. A diagonal leaving a grid
+    /// point in the SAME direction the access edge arrives from is a turn a wire cannot make, so
+    /// the reference deletes it from the graph before any search runs.
+    ///
+    /// ⚠️ The axis test is deliberately asymmetric: `snap_dy == 0` compares x, and everything else
+    /// compares y. Right angles are kept, and the edge just added to the snap is skipped.
+    fn an_acute_diagonal_out_of_an_access_point_is_pruned() {
+        // A 5x5 grid at 100 pitch; diagonals exist only where both indices are even.
+        let g = Grid { x: vec![0, 100, 200, 300, 400], y: vec![0, 100, 200, 300, 400] };
+        let build = || Graph::build(&g, &edges(&g, true), 1.0);
+
+        // ⚠️ The snap must sit BETWEEN two columns so its neighbours are x-neighbours, and one
+        // of them must be at an even/even index or it has no diagonals to prune at all. (200,200)
+        // is i=2, j=2; (200,100) — which a snap ON the column would reach — is j=1 and has none.
+        let centre = (150, 250);
+        let snap = (150, 200);
+
+        let mut kept = build();
+        let before = kept.adj[kept.index[&(200, 200)]].len();
+        insert_access(&mut kept, &g, centre, &[snap], false);
+        let without_prune = kept.adj[kept.index[&(200, 200)]].len();
+
+        let mut pruned = build();
+        insert_access(&mut pruned, &g, centre, &[snap], true);
+        let with_prune = pruned.adj[pruned.index[&(200, 200)]].len();
+
+        assert!(before > 0, "the fixture has edges to prune");
+        assert!(
+            with_prune < without_prune,
+            "allow45 must remove edges: {without_prune} without the prune, {with_prune} with it"
+        );
+
+        // ⚠️ A RIGHT-ANGLE neighbour is never pruned — (200,200)-(200,300) shares an x.
+        let v = pruned.index[&(200, 200)];
+        let right_angle = pruned.index.get(&(200, 300)).copied();
+        if let Some(ra) = right_angle {
+            assert!(
+                pruned.adj[v].iter().any(|&(o, _)| o == ra),
+                "a right-angle edge must survive the acute prune"
+            );
+        }
+
+        // ⛔ **The OTHER axis branch.** Above, `snap_dy == 0` and only the x comparison runs. A
+        // snap between two ROWS gives `snap_dy != 0`, which the reference settles on **y** — and
+        // the two branches select different edges, so a version that always compares x is a
+        // different router. Without this case that asymmetry is unwitnessed: a mutation replacing
+        // the whole test with the x rule passed every other test in this suite.
+        let (centre_y, snap_y) = ((250, 150), (200, 150));
+        let mut y_kept = build();
+        insert_access(&mut y_kept, &g, centre_y, &[snap_y], false);
+        let y_without = y_kept.adj[y_kept.index[&(200, 200)]].len();
+
+        let mut y_pruned = build();
+        insert_access(&mut y_pruned, &g, centre_y, &[snap_y], true);
+        let y_with = y_pruned.adj[y_pruned.index[&(200, 200)]].len();
+        assert!(
+            y_with < y_without,
+            "the y branch must prune too: {y_without} without, {y_with} with"
+        );
+
+        // The two branches must not pick the same survivors — that is what makes the asymmetry
+        // observable rather than decorative.
+        let surv = |gr: &Graph| -> Vec<Point> {
+            let vtx = gr.index[&(200, 200)];
+            let mut v: Vec<Point> = gr.adj[vtx].iter().map(|&(o, _)| gr.points[o]).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_ne!(
+            surv(&pruned),
+            surv(&y_pruned),
+            "the x branch and the y branch must remove different edges"
+        );
     }
 
     #[test]
