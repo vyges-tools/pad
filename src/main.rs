@@ -866,8 +866,17 @@ fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> 
         if !db.inst_is_placed(inst) {
             continue;
         }
-        let first = out.len();
         let master = db.inst_get_master(inst);
+        // ⛔ A terminal marked `RDL_ROUTE 0` is skipped — on the ITERM **or** on the MTERM behind
+        // it, either one is enough. ⚠️ Absent is not false: a terminal with no property at all is
+        // routed normally, so the three states have to stay distinct all the way down.
+        let blocked = |v: Option<bool>| v == Some(false);
+        if blocked(db.iterm_bool_property(&iterm, "RDL_ROUTE").unwrap_or(None))
+            || blocked(db.mterm_bool_property(&master, term, "RDL_ROUTE").unwrap_or(None))
+        {
+            continue;
+        }
+        let first = out.len();
         let orient = Orient::parse(&db.inst_get_orient(inst)).unwrap_or(Orient::R0);
         let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
 
