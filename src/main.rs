@@ -1347,6 +1347,23 @@ fn rdl_route(args: &[String]) -> ExitCode {
                         g.x.iter().copied().filter(|&x| x > a.0.min(b.0) && x < a.0.max(b.0)).collect();
                     if a.0 > b.0 { xs.reverse(); }
                     walk.extend(xs.into_iter().map(|x| (x, a.1)));
+                } else if let (Ok(ia), Ok(ja), Ok(ib), Ok(jb)) = (
+                    g.x.binary_search(&a.0), g.y.binary_search(&a.1),
+                    g.x.binary_search(&b.0), g.y.binary_search(&b.1),
+                ) {
+                    // ⚠️ A DIAGONAL run is several edges, not one: `makeGraph` joins (i, j) to
+                    // (i±1, j±1) only from an even-even point, but the edges are undirected, so
+                    // (i,j) -> (i+1,j+1) -> (i+2,j+2) chains through an odd-odd point using the
+                    // edge the NEXT even-even point contributed. Step one grid index at a time.
+                    let (dx, dy) = (ib as i64 - ia as i64, jb as i64 - ja as i64);
+                    if dx.abs() == dy.abs() && dx != 0 {
+                        let (sx, sy) = (dx.signum(), dy.signum());
+                        for k in 1..dx.abs() {
+                            let i = (ia as i64 + sx * k) as usize;
+                            let j = (ja as i64 + sy * k) as usize;
+                            walk.push((g.x[i], g.y[j]));
+                        }
+                    }
                 }
             }
             walk.push(*pts.last().unwrap());
