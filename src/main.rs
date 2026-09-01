@@ -1025,6 +1025,72 @@ fn rdl_obstructions(db: &Db, layer: &str, bloat: i32) -> Vec<rdl::Obstacle> {
     out
 }
 
+/// **G21** — obstructions that come from the DATABASE rather than from a placed instance:
+/// existing special wires, and block-level routing obstructions.
+///
+/// 🔑 **`populateObstructions` walks every net in the block, not only the ones being routed.**
+/// For each it inserts every special-wire box on the routing layer as an obstruction, bloated by
+/// `width/2 + spacing`, and skips exactly one thing:
+///
+/// ```text
+/// for swire in net->getSWires():
+///     if is_routing_net && swire->getWireType() != FIXED:  continue
+///     for box in swire->getWires():
+///         if box->getTechLayer() != layer_:  continue
+///         OCTILINEAR -> insert_obstruction_oct (the true octagon)
+///         else       -> insert_obstruction_rect
+/// ```
+///
+/// ⛔ **A FIXED swire on a net being routed still obstructs that net's own router.** The skip is
+/// not "my own net's metal does not count" — it is narrower than that. `route()` destroys every
+/// non-FIXED swire of the nets it is routing before it writes, so those are wires that are about
+/// to cease to exist; a FIXED one is kept and must be routed around. `rdl_route_keep_existing`
+/// is the case that says so: one pre-placed FIXED rectangle, and the reference lays 6 more wires
+/// than a router that drives straight through it.
+///
+/// ⚠️ Block obstructions are bloated the same way and carry no net at all.
+fn rdl_wire_obstructions(
+    db: &Db,
+    layer: &str,
+    bloat: i32,
+    routing: &std::collections::BTreeSet<String>,
+) -> Vec<rdl::Obstacle> {
+    let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
+    let mut out = Vec::new();
+    for net in db.net_names() {
+        let is_routing = routing.contains(&net);
+        for (l, fixed, oct, x0, y0, x1, y1, w) in
+            db.net_swire_obstacles(&net).unwrap_or_default()
+        {
+            if is_routing && !fixed {
+                continue;
+            }
+            if db.layer_name_by_number(l) != layer {
+                continue;
+            }
+            if oct {
+                // ⚠️ `odb::Oct::bloat(margin)` keeps the endpoints and rebuilds at
+                // `2 * (A + margin)`, where `A` is the stored `width / 2` — INTEGER division, so
+                // on an odd width this is not `width + 2 * margin`.
+                out.push(rdl::Obstacle::from_ring(rdl::oct_points(
+                    (x0, y0),
+                    (x1, y1),
+                    2 * (w / 2 + bloat),
+                )));
+            } else {
+                out.push(rdl::Obstacle::Rect(grow((x0, y0, x1, y1))));
+            }
+        }
+    }
+    for (l, x0, y0, x1, y1) in db.obstruction_boxes().unwrap_or_default() {
+        if db.layer_name_by_number(l) != layer {
+            continue;
+        }
+        out.push(rdl::Obstacle::Rect(grow((x0, y0, x1, y1))));
+    }
+    out
+}
+
 /// **G1-G5** — the RDL routing grid.
 ///
 /// ⚠️ Only the grid. The search, obstructions and rip-up are later stages, and asking for a route
@@ -1065,10 +1131,10 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let spacing = opts.get("spacing").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let to_dbu = |v: f64| (v * dbu as f64).round() as i32;
     let bloat = to_dbu(width) / 2 + to_dbu(spacing);
-    let obstructions = rdl_obstructions(&db, &layer, bloat);
-    let clear = rdl::edges_clear(&g, allow45, &|a, b| rdl::blocked(a, b, &obstructions));
 
-    // Routing targets, per net, for every net named on the command line.
+    // ⚠️ **The net list is resolved BEFORE the obstructions, because the obstructions depend on
+    // it.** `populateObstructions(nets)` takes the nets being routed and treats their own
+    // special wires differently from everyone else's.
     let mut nets: Vec<String> = Vec::new();
     if let Some(pats) = opts.get("nets") {
         let pats: Vec<String> = pats.split_whitespace().map(str::to_string).collect();
@@ -1077,6 +1143,25 @@ fn rdl_route(args: &[String]) -> ExitCode {
             .cloned()
             .collect();
     }
+    let routing: std::collections::BTreeSet<String> = nets.iter().cloned().collect();
+
+    // 🔑 **Two groups, kept in this order on purpose.** The instance-derived obstructions come
+    // first because they are the only ones a terminal may be excused from: upstream records the
+    // source object on each obstruction and the access-point filter excuses exactly
+    // `std::get<3>(value) == target.terminal`. A special wire and a block obstruction are stored
+    // with a null source, so they are never excused — see `access_own` below.
+    let mut obstructions = rdl_obstructions(&db, &layer, bloat);
+    let instance_obstructions = obstructions.len();
+    obstructions.extend(rdl_wire_obstructions(&db, &layer, bloat, &routing));
+    let clear = rdl::edges_clear(&g, allow45, &|a, b| rdl::blocked(a, b, &obstructions));
+    // The obstructions a terminal may be excused from — never the wire-derived ones.
+    let access_own = |centre: rdl::Point| -> Vec<rdl::Obstacle> {
+        obstructions[..instance_obstructions]
+            .iter()
+            .filter(|o| o.hits(centre, centre))
+            .cloned()
+            .collect()
+    };
     let mut target_report = String::new();
     let mut total_targets = 0usize;
     for n in &nets {
@@ -1209,11 +1294,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut graph = rdl::Graph::build(&g, &clear, 1.0);
         // Graft both terminals onto the grid, as the reference does before each attempt.
         for centre in [(sx, sy), (tx, ty)] {
-            let own: Vec<rdl::Obstacle> = obstructions
-                .iter()
-                .filter(|o| o.hits(centre, centre))
-                .cloned()
-                .collect();
+            let own = access_own(centre);
             let t = rdl::Target {
                 terminal: String::new(),
                 centre,
@@ -1331,11 +1412,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         for t in &targets {
             let (inst, pin) = t.terminal.rsplit_once('/').unwrap_or(("", ""));
             let (inst, pin) = (inst.to_string(), pin.to_string());
-            let own: Vec<rdl::Obstacle> = obstructions
-                .iter()
-                .filter(|o| o.hits(t.centre, t.centre))
-                .cloned()
-                .collect();
+            let own = access_own(t.centre);
             let snaps = rdl::access_points(&g, t, &obstructions, &own);
             // ⛔ …and then the terminal's own DIAGONAL pin edges. An octagonal pad's access line
             // may leave the target centre and cross a facet of the very pin it is reaching, which

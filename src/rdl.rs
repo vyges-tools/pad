@@ -499,6 +499,66 @@ pub fn insert_access(
     undo
 }
 
+/// **G21** — does an existing special wire obstruct the router?
+///
+/// 🔑 **Upstream rule** (`RDLRouter::populateObstructions`), and the narrowness is the point:
+///
+/// ```text
+/// for swire in net->getSWires():
+///     if is_routing_net && swire->getWireType() != FIXED:  continue
+/// ```
+///
+/// ⛔ It is **not** "a net's own metal does not obstruct it". `route()` destroys every non-FIXED
+/// swire of the nets being routed before it writes, so those wires are about to cease to exist and
+/// obstructing against them would be obstructing against nothing. A **FIXED** swire is kept — so it
+/// obstructs its own net's router, and every swire of every other net obstructs unconditionally.
+pub fn swire_obstructs(is_routing_net: bool, swire_is_fixed: bool) -> bool {
+    !(is_routing_net && !swire_is_fixed)
+}
+
+/// **G17a** — `odb::Oct::getPoints()`, the plain octagon, before any caller mutates its ring.
+///
+/// Shared by [`edge_obstruction`] — which is this shape with four ring indices reassigned — and by
+/// the obstruction built from an OCTILINEAR special wire, which uses it unaltered.
+///
+/// ```text
+/// Oct::init(p0, p1, width):  high = the point with the LARGER y (a tie makes p1 high)
+///                            A = width / 2                      # INTEGER division
+/// getDir():  RIGHT if high.x > low.x, else LEFT (UNKNOWN, when the centres coincide, takes LEFT)
+/// B = ceil((A * 2) / sqrt2) - A                                 # ceil in f64, then TRUNCATED
+/// ```
+///
+/// ⚠️ `A` and `B` are the two numeric traps: `width / 2` truncates, and `B`'s `ceil` happens in
+/// floating point and is then truncated into an integer. Computing either exactly is a different
+/// polygon (numeric reference §1).
+///
+/// Returns the 9-point ring, first point repeated last.
+pub fn oct_points(p0: Point, p1: Point, width: i32) -> Vec<Point> {
+    let (low, high) = if p0.1 > p1.1 { (p1, p0) } else { (p0, p1) };
+    let a = width / 2;
+    let b = (((a * 2) as f64) / std::f64::consts::SQRT_2).ceil() as i32 - a;
+    let right = high.0 > low.0;
+
+    let mut pts = vec![(0, 0); 9];
+    pts[0] = (low.0 - b, low.1 - a);
+    pts[8] = pts[0];
+    pts[1] = (low.0 + b, low.1 - a);
+    pts[4] = (high.0 + b, high.1 + a);
+    pts[5] = (high.0 - b, high.1 + a);
+    if right {
+        pts[2] = (high.0 + a, high.1 - b);
+        pts[3] = (high.0 + a, high.1 + b);
+        pts[6] = (low.0 - a, low.1 + b);
+        pts[7] = (low.0 - a, low.1 - b);
+    } else {
+        pts[2] = (low.0 + a, low.1 - b);
+        pts[3] = (low.0 + a, low.1 + b);
+        pts[6] = (high.0 - a, high.1 + b);
+        pts[7] = (high.0 - a, high.1 - b);
+    }
+    pts
+}
+
 /// **G17** — the swept octagon a 45° wire occupies, upstream's `RDLSegment::getEdgeObstruction`.
 ///
 /// 🔑 **The whole calculation, transcribed** (`RDLSegment.cpp` + `odb::Oct` in `geom.h`):
@@ -526,27 +586,8 @@ pub fn insert_access(
 pub fn edge_obstruction(p0: Point, p1: Point, dist: i32) -> Vec<Point> {
     // `Oct(p0, p1, 2 * dist)` — so A is exactly `dist`.
     let (low, high) = if p0.1 > p1.1 { (p1, p0) } else { (p0, p1) };
-    let a = (2 * dist) / 2;
-    let b = (((a * 2) as f64) / std::f64::consts::SQRT_2).ceil() as i32 - a;
     let right = high.0 > low.0;
-
-    let mut pts = vec![(0, 0); 9];
-    pts[0] = (low.0 - b, low.1 - a);
-    pts[8] = pts[0];
-    pts[1] = (low.0 + b, low.1 - a);
-    pts[4] = (high.0 + b, high.1 + a);
-    pts[5] = (high.0 - b, high.1 + a);
-    if right {
-        pts[2] = (high.0 + a, high.1 - b);
-        pts[3] = (high.0 + a, high.1 + b);
-        pts[6] = (low.0 - a, low.1 + b);
-        pts[7] = (low.0 - a, low.1 - b);
-    } else {
-        pts[2] = (low.0 + a, low.1 - b);
-        pts[3] = (low.0 + a, low.1 + b);
-        pts[6] = (high.0 - a, high.1 + b);
-        pts[7] = (high.0 - a, high.1 - b);
-    }
+    let mut pts = oct_points(p0, p1, 2 * dist);
 
     if right {
         pts[1].0 = low.0 + dist;
@@ -2388,6 +2429,37 @@ mod obstacle_tests {
     use super::*;
 
     /// The octagonal bump pad from `passive_tech/bumps.lef` (`BUMP45`), centred on the origin.
+    #[test]
+    fn a_fixed_swire_on_the_net_being_routed_still_obstructs_it() {
+        // ⛔ The load-bearing case, and the one a "skip my own net" reading gets wrong.
+        // `rdl_route_keep_existing` places one FIXED rectangle on VDD and then routes VDD; the
+        // reference lays 6 more wires than a router that drives straight through it.
+        assert!(swire_obstructs(true, true), "a FIXED swire is kept, so it obstructs its own net");
+        // The only skip: a wire `route()` is about to destroy and rebuild.
+        assert!(!swire_obstructs(true, false));
+        // Another net's wires obstruct whatever their type.
+        assert!(swire_obstructs(false, false));
+        assert!(swire_obstructs(false, true));
+    }
+
+    #[test]
+    fn the_plain_octagon_keeps_odbs_truncated_b() {
+        // `Oct((0,0), (0,100), 40)`: A = 40/2 = 20, B = ceil(40 / sqrt2) - 20 = ceil(28.284) - 20
+        // = 29 - 20 = 9. ⚠️ Both steps truncate; computing B exactly gives a different polygon.
+        let pts = oct_points((0, 0), (0, 100), 40);
+        assert_eq!(pts.len(), 9);
+        assert_eq!(pts[0], (-9, -20), "low oct (-B, -A)");
+        assert_eq!(pts[8], pts[0], "the ring is closed");
+        assert_eq!(pts[1], (9, -20), "low oct (B, -A)");
+        assert_eq!(pts[4], (9, 120), "high oct (B, A)");
+        assert_eq!(pts[5], (-9, 120), "high oct (-B, A)");
+        // ⚠️ Vertical: `high.x > low.x` is false, so `getDir()` is LEFT, not RIGHT.
+        assert_eq!(pts[2], (20, -9), "LEFT: low oct (A, -B)");
+        assert_eq!(pts[6], (-20, 109), "LEFT: high oct (-A, B)");
+        // A tie on y makes the SECOND point `high` — `Oct::init` compares with `>`.
+        assert_eq!(oct_points((0, 0), (100, 0), 40)[4], (109, 20));
+    }
+
     fn octagon() -> Vec<Point> {
         vec![
             (12_000, -28_000),
