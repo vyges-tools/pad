@@ -1658,6 +1658,23 @@ fn rdl_route(args: &[String]) -> ExitCode {
             routes.pop();
         }
     }
+    // The access lines themselves: one line per `centre -> snap` pair. `populateTerminalAccessPoints`
+    // tests every one of these against the grid edges it crosses, and this dumps them so that test
+    // can be reproduced outside the engine before it is built into it.
+    if let Some(path) = opts.get("access-report") {
+        let mut body = String::new();
+        for (term, (_net, targets)) in access.iter() {
+            for (centre, snaps) in targets {
+                for s in snaps {
+                    body.push_str(&format!("{term} {} {} {} {}\n", centre.0, centre.1, s.0, s.1));
+                }
+            }
+        }
+        if let Err(e) = std::fs::write(path, body) {
+            eprintln!("vyges-pad: cannot write {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
 
     let mut graph = rdl::Graph::build(&g, &clear, 1.0);
     let done =
