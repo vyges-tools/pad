@@ -156,8 +156,68 @@ pub fn hits(p0: Point, p1: Point, r: Rect) -> bool {
 /// exact for this question, not an approximation: a segment meets a polygon exactly when it meets
 /// one of the rectangles a decomposition of that polygon is made of, and touching counts either
 /// way. It is only the *shape* that is decomposed, never the region.
-pub fn blocked(p0: Point, p1: Point, obstructions: &[Rect]) -> bool {
-    obstructions.iter().any(|&r| hits(p0, p1, r))
+pub fn blocked(p0: Point, p1: Point, obstructions: &[Obstacle]) -> bool {
+    obstructions.iter().any(|o| o.hits(p0, p1))
+}
+
+/// **G20** — one thing the router must not run into, **at its real shape**.
+///
+/// ⛔ **A 45° pin is not a rectangle and cannot be decomposed into rectangles.**
+/// `populateObstructions` stores each obstruction twice: an enclosing `odb::Rect` that indexes it
+/// in the R-tree, and the true `odb::Polygon` (or `odb::Oct`) that decides the hit. We used to keep
+/// only rectangles, on the stated grounds that a segment meets a polygon exactly when it meets one
+/// of the rectangles the polygon decomposes into.
+///
+/// ⚠️ **That is true for a rectilinear polygon and FALSE for an octagon.** OpenDB's decomposition
+/// goes through `polygon_90`, which cannot represent a 45° edge, so an octagonal bump pad comes
+/// back as three rectangles that are not the same shape — over-covering one corner and
+/// under-covering the opposite one. The router then refuses tracks where there is no metal and
+/// offers tracks where there is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Obstacle {
+    Rect(Rect),
+    /// A closed ring, with its enclosing rectangle kept alongside as a cheap reject.
+    Poly { bbox: Rect, points: Vec<Point> },
+}
+
+impl Obstacle {
+    /// The enclosing rectangle — what the reference indexes on.
+    pub fn bbox(&self) -> Rect {
+        match self {
+            Obstacle::Rect(r) => *r,
+            Obstacle::Poly { bbox, .. } => *bbox,
+        }
+    }
+
+    /// Does the segment `p0`–`p1` touch this obstacle?
+    pub fn hits(&self, p0: Point, p1: Point) -> bool {
+        match self {
+            Obstacle::Rect(r) => hits(p0, p1, *r),
+            // ⚠️ The bounding box is a reject, never an accept: passing it only means the exact
+            // test is worth running.
+            Obstacle::Poly { bbox, points } => {
+                hits(p0, p1, *bbox) && segment_hits_polygon(p0, p1, points)
+            }
+        }
+    }
+
+    /// Build from a closed ring, collapsing an axis-aligned rectangle back to the cheap form.
+    pub fn from_ring(points: Vec<Point>) -> Obstacle {
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for &(x, y) in &points {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        let bbox = (x0, y0, x1, y1);
+        // A ring whose every point is a corner of its own bounding box IS that rectangle, and the
+        // rectangle test is both cheaper and exact.
+        if points.iter().all(|&(x, y)| (x == x0 || x == x1) && (y == y0 || y == y1)) {
+            return Obstacle::Rect(bbox);
+        }
+        Obstacle::Poly { bbox, points }
+    }
 }
 
 /// Every edge in the grid, as point pairs, each counted once.
@@ -232,14 +292,19 @@ pub fn nearest_tracks(axis: &[i32], at: i32, usable: &dyn Fn(i32) -> bool) -> Ve
 /// ⚠️ An obstruction belonging to **this** terminal does not count. The target sits inside its own
 /// pin metal, so every access line starts inside it; treating that as a violation would remove
 /// every access point the terminal has and make the net unroutable.
-pub fn access_points(g: &Grid, target: &Target, obstructions: &[Rect], own: &[Rect]) -> Vec<Point> {
-    let foreign = |r: &Rect| !own.contains(r);
+pub fn access_points(
+    g: &Grid,
+    target: &Target,
+    obstructions: &[Obstacle],
+    own: &[Obstacle],
+) -> Vec<Point> {
+    let foreign = |o: &Obstacle| !own.contains(o);
     // ⚠️ **No exemption here.** A candidate track is rejected if it lies inside ANY obstruction,
     // the terminal's own metal included. The exemption applies only to the line test below. Excusing
     // it here picks tracks inside the terminal's own pad, where every grid edge has been filtered
     // away — the access points then attach to dead grid points and the terminal is unreachable,
     // with four perfectly plausible-looking access points to show for it.
-    let clear = |p: Point| !obstructions.iter().any(|r| hits(p, p, *r));
+    let clear = |p: Point| !obstructions.iter().any(|o| o.hits(p, p));
     let mut out = Vec::new();
     for x in nearest_tracks(&g.x, target.centre.0, &|x| clear((x, target.centre.1))) {
         out.push((x, target.centre.1));
@@ -247,7 +312,7 @@ pub fn access_points(g: &Grid, target: &Target, obstructions: &[Rect], own: &[Re
     for y in nearest_tracks(&g.y, target.centre.1, &|y| clear((target.centre.0, y))) {
         out.push((target.centre.0, y));
     }
-    out.retain(|&p| !obstructions.iter().any(|r| foreign(r) && hits(target.centre, p, *r)));
+    out.retain(|&p| !obstructions.iter().any(|o| foreign(o) && o.hits(target.centre, p)));
     out.sort_unstable();
     out.dedup();
     out
@@ -1659,7 +1724,7 @@ mod tests {
         let coords: Vec<i32> = (0..5).map(|i| 10 + i * 100).collect();
         let g = grid(&coords, &coords, 4, 4);
         // A wall across the middle column, open at the top.
-        let wall = [(150, 0, 170, 350)];
+        let wall = [Obstacle::Rect((150, 0, 170, 350))];
         let e = edges_clear(&g, false, &|a, b| blocked(a, b, &wall));
         let graph = Graph::build(&g, &e, 1.0);
         let path = shortest_path(&graph, (10, 10), (410, 10), 2.0);
@@ -1671,7 +1736,7 @@ mod tests {
     fn an_unreachable_goal_gives_no_path() {
         let coords: Vec<i32> = (0..5).map(|i| 10 + i * 100).collect();
         let g = grid(&coords, &coords, 4, 4);
-        let wall = [(150, -100, 170, 1000)];
+        let wall = [Obstacle::Rect((150, -100, 170, 1000))];
         let e = edges_clear(&g, false, &|a, b| blocked(a, b, &wall));
         let graph = Graph::build(&g, &e, 1.0);
         assert!(shortest_path(&graph, (10, 10), (410, 10), 2.0).is_empty());
@@ -1714,8 +1779,8 @@ mod tests {
         let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
         let own = (140, 140, 160, 160);
         let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![] };
-        assert_eq!(access_points(&g, &t, &[own], &[own]).len(), 4);
-        assert!(access_points(&g, &t, &[own], &[]).is_empty(), "not excused, none survive");
+        assert_eq!(access_points(&g, &t, &[Obstacle::Rect(own)], &[Obstacle::Rect(own)]).len(), 4);
+        assert!(access_points(&g, &t, &[Obstacle::Rect(own)], &[]).is_empty(), "not excused, none survive");
     }
 
     #[test]
@@ -1726,7 +1791,7 @@ mod tests {
         let g = Grid { x: vec![0, 100, 200, 300], y: vec![150] };
         let own = (90, 140, 210, 160);
         let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![] };
-        let pts = access_points(&g, &t, &[own], &[own]);
+        let pts = access_points(&g, &t, &[Obstacle::Rect(own)], &[Obstacle::Rect(own)]);
         assert!(!pts.contains(&(100, 150)), "inside the pad, rejected as a candidate");
         assert!(!pts.contains(&(200, 150)), "likewise");
         assert!(pts.contains(&(0, 150)) && pts.contains(&(300, 150)), "the live tracks outside");
@@ -1818,7 +1883,7 @@ mod tests {
             access: vec![],
         };
         // A wall just left of the centre blocks the westward access only.
-        let wall = [(120, 0, 130, 300)];
+        let wall = [Obstacle::Rect((120, 0, 130, 300))];
         let pts = access_points(&g, &t, &wall, &[]);
         assert!(!pts.contains(&(100, 150)), "west is blocked");
         assert!(pts.contains(&(200, 150)), "east is not");
@@ -1847,7 +1912,7 @@ mod tests {
         let coords: Vec<i32> = (0..4).map(|i| 10 + i * 20).collect();
         let g = grid(&coords, &coords, 4, 4);
         let all = edges(&g, false).len();
-        let blocker = [(25, 0, 35, 1000)];
+        let blocker = [Obstacle::Rect((25, 0, 35, 1000))];
         let some = edges_clear(&g, false, &|a, b| blocked(a, b, &blocker)).len();
         assert!(some < all, "a wall removes edges");
         assert_eq!(g.vertices(), 16, "and removes no vertices");
@@ -2289,5 +2354,89 @@ mod write_order_tests {
         );
         // …and the attempt log proves the two orders really did disagree.
         assert_eq!(out.log.first().map(|(s, _, _)| *s), Some((0, 1000)), "C/p was attempted first");
+    }
+}
+
+#[cfg(test)]
+mod obstacle_tests {
+    use super::*;
+
+    /// The octagonal bump pad from `passive_tech/bumps.lef` (`BUMP45`), centred on the origin.
+    fn octagon() -> Vec<Point> {
+        vec![
+            (12_000, -28_000),
+            (-12_000, -28_000),
+            (-28_000, -12_000),
+            (-28_000, 12_000),
+            (-12_000, 28_000),
+            (12_000, 28_000),
+            (28_000, 12_000),
+            (28_000, -12_000),
+            (12_000, -28_000),
+        ]
+    }
+
+    // ⛔ The reason obstructions stopped being rectangles. OpenDB decomposes this octagon through
+    // `polygon_90`, which cannot hold a 45° edge, into three rectangles:
+    //     x[-28000,12000] y[-28000,-12000],  x[-28000,28000] y[-12000,12000],
+    //     x[-12000,28000] y[12000,28000]
+    // The corner at (-24000, -24000) is OUTSIDE the octagon but inside that union, and the corner
+    // at (24000, -24000) is the mirror case: inside neither, but the octagon's own edge runs much
+    // closer there. The two shapes are not the same, and the union is not even a cover.
+    #[test]
+    fn the_rectangle_decomposition_of_an_octagon_is_not_the_octagon() {
+        let oct = Obstacle::from_ring(octagon());
+        let decomposed = [
+            Obstacle::Rect((-28_000, -28_000, 12_000, -12_000)),
+            Obstacle::Rect((-28_000, -12_000, 28_000, 12_000)),
+            Obstacle::Rect((-12_000, 12_000, 28_000, 28_000)),
+        ];
+        // A point in the cut-off bottom-left corner: the decomposition says metal, the octagon
+        // says empty space.
+        let p = (-24_000, -24_000);
+        assert!(decomposed.iter().any(|o| o.hits(p, p)), "the decomposition covers this corner");
+        assert!(!oct.hits(p, p), "the octagon does not — it is cut off at 45 degrees");
+    }
+
+    #[test]
+    fn an_octagon_blocks_a_line_through_its_body_and_not_one_past_its_cut_corner() {
+        let oct = Obstacle::from_ring(octagon());
+        assert!(oct.hits((-40_000, 0), (40_000, 0)), "straight through the middle");
+        assert!(oct.hits((0, -40_000), (0, 40_000)), "and the other way");
+        // Along the bottom-left diagonal, clear of the cut corner but inside the bounding box.
+        assert!(!oct.hits((-40_000, -22_000), (-22_000, -40_000)), "outside the cut corner");
+        assert!(!oct.hits((-40_000, -40_000), (40_000, -40_000)), "well below it");
+    }
+
+    // ⚠️ The bounding box is a REJECT, never an accept — a segment inside the box but outside the
+    // shape must not count. That is the whole point of keeping the ring.
+    #[test]
+    fn the_bounding_box_never_decides_a_hit_on_its_own() {
+        let oct = Obstacle::from_ring(octagon());
+        assert_eq!(oct.bbox(), (-28_000, -28_000, 28_000, 28_000));
+        let corner = ((-28_000, -28_000), (-24_000, -24_000));
+        assert!(hits(corner.0, corner.1, oct.bbox()), "inside the bounding box");
+        assert!(!oct.hits(corner.0, corner.1), "but outside the octagon");
+    }
+
+    // A rectilinear ring collapses back to the cheap form, because there the rectangle test IS
+    // exact — and it is the overwhelmingly common case.
+    #[test]
+    fn a_rectangular_ring_collapses_to_a_rectangle() {
+        let r = Obstacle::from_ring(vec![(0, 0), (100, 0), (100, 50), (0, 50), (0, 0)]);
+        assert_eq!(r, Obstacle::Rect((0, 0, 100, 50)));
+        // …and an L-shape does not, even though every edge of it is axis-aligned.
+        let l = Obstacle::from_ring(vec![
+            (0, 0),
+            (100, 0),
+            (100, 50),
+            (50, 50),
+            (50, 100),
+            (0, 100),
+            (0, 0),
+        ]);
+        assert!(matches!(l, Obstacle::Poly { .. }), "an L is not its bounding box");
+        assert!(!l.hits((60, 60), (90, 90)), "the notch is empty");
+        assert!(l.hits((10, 60), (40, 90)), "the arm is not");
     }
 }

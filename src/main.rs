@@ -951,7 +951,7 @@ fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> 
 ///
 /// ⚠️ Bloating happens **before** the subtraction, not after. Bloating the result instead would
 /// eat into the pin openings by the clearance and could close them entirely.
-fn rdl_obstructions(db: &Db, layer: &str, bloat: i32) -> Vec<(i32, i32, i32, i32)> {
+fn rdl_obstructions(db: &Db, layer: &str, bloat: i32) -> Vec<rdl::Obstacle> {
     use vyges_loom::poly90::{Poly90Set, Rect as P90Rect};
     let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
     let on_layer = |v: Vec<(i64, i32, i32, i32, i32)>| -> Vec<(i32, i32, i32, i32)> {
@@ -993,13 +993,32 @@ fn rdl_obstructions(db: &Db, layer: &str, bloat: i32) -> Vec<(i32, i32, i32, i32
         });
         for r in shape.clone() {
             // Already bloated, so it moves onto the die unchanged.
-            out.push(pin_shape(r, orient, origin));
+            out.push(rdl::Obstacle::Rect(pin_shape(r, orient, origin)));
         }
 
-        // The instance's own pin metal.
+        // ⛔ **The instance's own pin metal, at its REAL shape.** `getITermShapes` reads the two
+        // forms separately — `getPolygonGeometry()` for POLYGON ports, `getGeometry(false)` for
+        // RECT ones — and bloats each **as a polygon**, so an octagonal bump pad stays an octagon.
+        //
+        // ⚠️ Taking `getGeometry()`'s default here instead reports the polygon a second time, as
+        // the rectangles OpenDB decomposes it into — and that decomposition goes through
+        // `polygon_90`, which cannot hold a 45° edge. The result is neither the same shape nor a
+        // conservative cover of it: it over-covers one corner and under-covers the opposite one.
         for term in db.master_get_m_terms(&master) {
-            for r in on_layer(db.mterm_pin_boxes(&master, &term).unwrap_or_default()) {
-                out.push(grow(pin_shape(r, orient, origin)));
+            for r in on_layer(db.mterm_pin_boxes_excluding_polygons(&master, &term).unwrap_or_default()) {
+                out.push(rdl::Obstacle::Rect(grow(pin_shape(r, orient, origin))));
+            }
+        }
+        for term in db.master_get_m_terms(&master) {
+            let iterm = format!("{inst}/{term}");
+            for (l, pts) in db.iterm_pin_polygons(&iterm).unwrap_or_default() {
+                if db.layer_name_by_number(l) != layer {
+                    continue;
+                }
+                // Bloated as a polygon by the same library the reference calls; the points are
+                // already through the instance transform.
+                let ring = db.polygon_bloat(&pts, bloat).unwrap_or(pts);
+                out.push(rdl::Obstacle::from_ring(ring));
             }
         }
     }
@@ -1180,10 +1199,10 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut graph = rdl::Graph::build(&g, &clear, 1.0);
         // Graft both terminals onto the grid, as the reference does before each attempt.
         for centre in [(sx, sy), (tx, ty)] {
-            let own: Vec<(i32, i32, i32, i32)> = obstructions
+            let own: Vec<rdl::Obstacle> = obstructions
                 .iter()
-                .copied()
-                .filter(|r| rdl::hits(centre, centre, *r))
+                .filter(|o| o.hits(centre, centre))
+                .cloned()
                 .collect();
             let t = rdl::Target {
                 terminal: String::new(),
@@ -1300,10 +1319,10 @@ fn rdl_route(args: &[String]) -> ExitCode {
         for t in &targets {
             let (inst, pin) = t.terminal.rsplit_once('/').unwrap_or(("", ""));
             let (inst, pin) = (inst.to_string(), pin.to_string());
-            let own: Vec<(i32, i32, i32, i32)> = obstructions
+            let own: Vec<rdl::Obstacle> = obstructions
                 .iter()
-                .copied()
-                .filter(|r| rdl::hits(t.centre, t.centre, *r))
+                .filter(|o| o.hits(t.centre, t.centre))
+                .cloned()
                 .collect();
             let snaps = rdl::access_points(&g, t, &obstructions, &own);
             // ⛔ …and then the terminal's own DIAGONAL pin edges. An octagonal pad's access line
