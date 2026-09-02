@@ -1322,6 +1322,60 @@ pub struct Routed {
     pub failed: Vec<String>,
 }
 
+/// **L9a** — `RDLNet::isRouted`: are these two terminals ALREADY CONNECTED, through any chain of
+/// committed routes?
+///
+/// ⛔ **It is a transitive search, not a pair lookup.** `updateRoute` records each committed
+/// segment's two terminals in `routed_pairs_` **both ways**, and `isRouted` then descends that
+/// graph:
+///
+/// ```text
+/// isRouted(source, dest):        if source == dest: true
+///                                visited = {};  isRouted(source, dest, visited)
+/// isRouted(source, dest, seen):  dests = routed_pairs_[source]  (absent -> false)
+///                                if dest in dests: true
+///                                for d in dests: if d not in seen: seen += d
+///                                                if isRouted(d, dest, seen): true
+///                                false
+/// ```
+///
+/// ⚠️ Only segments that actually committed a path contribute: `updateRoute` is reached from
+/// `setRoute` and `resetRoute`, never from the `setRouted()` that `preprocess` ends in, so a locked
+/// segment is not in this graph.
+pub fn routed_pairs(routes: &[Route]) -> std::collections::HashMap<&str, Vec<&str>> {
+    let mut adj: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+    for r in routes {
+        if !r.routed || r.points.len() <= 1 {
+            continue;
+        }
+        let Some(d) = r.dests.get(r.next.saturating_sub(1)) else { continue };
+        adj.entry(r.source.as_str()).or_default().push(d.terminal.as_str());
+        adj.entry(d.terminal.as_str()).or_default().push(r.source.as_str());
+    }
+    adj
+}
+
+/// **L9b** — the descent itself, over the graph [`routed_pairs`] builds.
+pub fn is_routed(adj: &std::collections::HashMap<&str, Vec<&str>>, source: &str, dest: &str) -> bool {
+    if source == dest {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<&str> = Default::default();
+    let mut stack = vec![source];
+    while let Some(n) = stack.pop() {
+        let Some(ns) = adj.get(n) else { continue };
+        for &m in ns {
+            if m == dest {
+                return true;
+            }
+            if seen.insert(m) {
+                stack.push(m);
+            }
+        }
+    }
+    false
+}
+
 /// **L8** — is this access point too close to a route already committed?
 ///
 /// Compares the box of `(width + spacing) / 2` around the point against the same-sized box around
@@ -1412,13 +1466,13 @@ pub fn route_all(
                         r.routed && r.points.len() > 1 && r.dests.get(r.next.saturating_sub(1))
                             .is_some_and(|x| x.terminal == cand.terminal)
                     });
-                let reversed = routes.iter().any(|r| {
-                    r.routed
-                        && r.source == cand.terminal
-                        && r.dests.get(r.next.saturating_sub(1))
-                            .is_some_and(|x| x.terminal == routes[i].source)
-                });
-                if !served && !reversed {
+                // ⛔ **`net_->isRouted(iterm_, dst)` is TRANSITIVE.** An earlier version tested
+                // only the direct reverse pair, which misses a destination this segment can
+                // already reach through a chain of other committed routes — and the reference
+                // skips those, so we would route a connection it considers already made.
+                let adj = routed_pairs(routes);
+                let already = is_routed(&adj, &routes[i].source, &cand.terminal);
+                if !served && !already {
                     break Some(cand);
                 }
             };
@@ -2397,6 +2451,50 @@ mod write_order_tests {
             locked: false,
             stubs: Vec::new(),
         }
+    }
+
+    /// ⛔ **`RDLNet::isRouted` descends the graph; it is not a pair lookup.** A and C are never
+    /// joined directly, but A–B and B–C are both committed, so the reference considers A already
+    /// connected to C and refuses to route it again.
+    ///
+    /// 🔑 This is the test that fails if the descent is reduced to the direct pair, which is what
+    /// this engine did until the call-graph review found `isRouted` had no transitive counterpart.
+    #[test]
+    fn two_terminals_joined_through_a_chain_count_as_already_routed() {
+        let mut ab = route("A", (0, 0), dest("B", (100, 0), 1), 1);
+        ab.routed = true;
+        ab.next = 1;
+        ab.points = vec![(0, 0), (100, 0)];
+        let mut bc = route("B", (100, 0), dest("C", (200, 0), 2), 2);
+        bc.routed = true;
+        bc.next = 1;
+        bc.points = vec![(100, 0), (200, 0)];
+        let routes = vec![ab, bc];
+        let adj = routed_pairs(&routes);
+
+        assert!(is_routed(&adj, "A", "B"), "the direct pair");
+        assert!(is_routed(&adj, "B", "A"), "and its reverse — the graph is undirected");
+        assert!(
+            is_routed(&adj, "A", "C"),
+            "A reaches C THROUGH B; a direct-pair test would miss this and route it again"
+        );
+        assert!(is_routed(&adj, "C", "A"), "and the same the other way");
+        assert!(!is_routed(&adj, "A", "D"), "an unconnected terminal is not routed");
+        assert!(is_routed(&adj, "A", "A"), "`if (source == dest) return true`");
+    }
+
+    /// ⚠️ A LOCKED segment contributes nothing to the graph. `preprocess` ends in `setRouted()`,
+    /// and `net_->updateRoute` is reached only from `setRoute` and `resetRoute` — so the pair it
+    /// locked was never recorded, and other segments go on offering that terminal.
+    #[test]
+    fn a_locked_segment_is_not_in_the_routed_graph() {
+        let mut locked = route("A", (0, 0), dest("B", (100, 0), 1), 1);
+        locked.routed = true;
+        locked.locked = true;
+        locked.next = 1; // its destination IS recorded, but no path was committed
+        let routes = vec![locked];
+        let adj = routed_pairs(&routes);
+        assert!(!is_routed(&adj, "A", "B"), "a locked pair never enters routed_pairs_");
     }
 
     // ⚠️ A route that never connected contributes NOTHING. Upstream guards the write with
