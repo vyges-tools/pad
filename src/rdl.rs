@@ -292,6 +292,11 @@ pub struct Target {
     pub shape: Rect,
     /// Grid points from which this target can be reached, filled in by [`access_points`].
     pub access: Vec<Point>,
+    /// ⛔ **The layer this target's PIN metal is on, which is not always the routing layer.**
+    /// With `-bump_via` or `-pad_via`, `generateRoutingTargets` accepts pin geometry on the via's
+    /// *other* layer and makes the via's enclosure the target. `writeToDb` then keys off exactly
+    /// this: `source->layer != layer_` is what makes it drop a via at that end.
+    pub layer: String,
 }
 
 /// **G9** — the greatest usable grid coordinate strictly below `at`, and the least strictly above.
@@ -2018,6 +2023,7 @@ mod tests {
             centre: (150, 150),
             shape: (140, 140, 160, 160),
             access: vec![],
+            layer: String::new(),
         };
         let mut pts = access_points(&g, &t, &[], &[]);
         pts.sort_unstable();
@@ -2030,7 +2036,7 @@ mod tests {
         // that as a violation leaves the terminal with no way in at all.
         let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
         let own = (140, 140, 160, 160);
-        let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![] };
+        let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![], layer: String::new() };
         assert_eq!(access_points(&g, &t, &[Obstacle::Rect(own)], &[Obstacle::Rect(own)]).len(), 4);
         assert!(access_points(&g, &t, &[Obstacle::Rect(own)], &[]).is_empty(), "not excused, none survive");
     }
@@ -2042,7 +2048,7 @@ mod tests {
         // filtered out — so accepting it yields access points that reach nothing.
         let g = Grid { x: vec![0, 100, 200, 300], y: vec![150] };
         let own = (90, 140, 210, 160);
-        let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![] };
+        let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![], layer: String::new() };
         let pts = access_points(&g, &t, &[Obstacle::Rect(own)], &[Obstacle::Rect(own)]);
         assert!(!pts.contains(&(100, 150)), "inside the pad, rejected as a candidate");
         assert!(!pts.contains(&(200, 150)), "likewise");
@@ -2133,6 +2139,7 @@ mod tests {
             centre: (150, 150),
             shape: (140, 140, 160, 160),
             access: vec![],
+            layer: String::new(),
         };
         // A wall just left of the centre blocks the westward access only.
         let wall = [Obstacle::Rect((120, 0, 130, 300))];

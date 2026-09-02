@@ -860,7 +860,20 @@ fn make_special(db: &mut Db, net: &str) -> Result<(), String> {
 /// ⛔ Reading a polygon as its enclosing rectangle, or letting `getGeometry()` decompose it into
 /// rectangles (which is that call's default), both give a wrong answer with no error: an octagonal
 /// bump pad has four targets on its flat sides, not one in its middle and not a staircase.
-fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> {
+/// **G6** — every place on a net a wire may land.
+///
+/// ⛔ **`access` is the `-bump_via` / `-pad_via` configuration**: `(other layer, via name)` for a
+/// COVER terminal and for a non-cover one. `generateRoutingTargets` accepts pin geometry on the
+/// routing layer **or** on the via's other layer, and for the latter the target is not the pin at
+/// all — it is the via's own enclosure box on that layer, recentred on the pin, which is where the
+/// via will be dropped.
+fn rdl_targets(
+    db: &Db,
+    net: &str,
+    layer: &str,
+    width: i32,
+    access: (&Option<(String, String)>, &Option<(String, String)>),
+) -> Vec<rdl::Target> {
     let mut out = Vec::new();
     for iterm in db.net_get_i_terms(net) {
         let Some((inst, term)) = iterm.rsplit_once('/') else { continue };
@@ -881,10 +894,47 @@ fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> 
         let orient = Orient::parse(&db.inst_get_orient(inst)).unwrap_or(Orient::R0);
         let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
 
+        // ⚠️ Which via applies is decided by the TERMINAL's kind, not the net's.
+        let cover = db.master_is_cover(&master);
+        let via_cfg = if cover { access.0 } else { access.1 };
+        let other_layer = via_cfg.as_ref().map(|(l, _)| l.as_str()).unwrap_or("");
+
+        // The via's enclosure on the other layer, recentred on a pin box's centre. This is the
+        // whole of the `use_via` branch: the pin's own shape is discarded and the via's is used.
+        let via_target = |c: (i32, i32)| -> Option<(i32, i32, i32, i32)> {
+            let (ol, via) = via_cfg.as_ref()?;
+            for (l, x0, y0, x1, y1) in db.tech_via_boxes(via).unwrap_or_default() {
+                if db.layer_name_by_number(l) == *ol {
+                    return Some((x0 + c.0, y0 + c.1, x1 + c.0, y1 + c.1));
+                }
+            }
+            None
+        };
+
         // ⚠️ Polygons first, matching the reference's call order. The points come back already
         // through the instance transform, and the shrink happens after it, not before.
         for (l, pts) in db.iterm_pin_polygons(&iterm).unwrap_or_default() {
-            if db.layer_name_by_number(l) != layer {
+            let found = db.layer_name_by_number(l);
+            if found != layer && found != other_layer {
+                continue;
+            }
+            // ⛔ **On the OTHER layer the pin's shape is not the target — the via's is.** The
+            // reference replaces `box` with the via's enclosure recentred on the pin, sets
+            // `use_via`, and pushes that single rect whole; the shrink-and-walk-the-edges path
+            // below is skipped entirely.
+            if found == other_layer {
+                let bb = pts.iter().fold((i32::MAX, i32::MAX, i32::MIN, i32::MIN), |a, &(x, y)| {
+                    (a.0.min(x), a.1.min(y), a.2.max(x), a.3.max(y))
+                });
+                if let Some(shape) = via_target((((bb.0 + bb.2) / 2), ((bb.1 + bb.3) / 2))) {
+                    out.push(rdl::Target {
+                        terminal: iterm.clone(),
+                        centre: ((shape.0 + shape.2) / 2, (shape.1 + shape.3) / 2),
+                        shape,
+                        access: Vec::new(),
+                        layer: found.clone(),
+                    });
+                }
                 continue;
             }
             let small = db.polygon_bloat(&pts, -width / 2).unwrap_or_default();
@@ -900,6 +950,7 @@ fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> 
                     centre: ((shape.0 + shape.2) / 2, (shape.1 + shape.3) / 2),
                     shape,
                     access: Vec::new(),
+                    layer: layer.to_string(),
                 });
             };
             let mut added = false;
@@ -921,15 +972,28 @@ fn rdl_targets(db: &Db, net: &str, layer: &str, width: i32) -> Vec<rdl::Target> 
         for (l, x0, y0, x1, y1) in
             db.mterm_pin_boxes_excluding_polygons(&master, term).unwrap_or_default()
         {
-            if db.layer_name_by_number(l) != layer {
+            let found = db.layer_name_by_number(l);
+            if found != layer && found != other_layer {
                 continue;
             }
-            let shape = pin_shape((x0, y0, x1, y1), orient, origin);
+            let placed = pin_shape((x0, y0, x1, y1), orient, origin);
+            // ⚠️ The via enclosure is centred on the pin AFTER the instance transform, because
+            // the reference applies `xform` to the recentred box and the enclosure is symmetric.
+            let shape = if found == other_layer {
+                let c = ((placed.0 + placed.2) / 2, (placed.1 + placed.3) / 2);
+                match via_target(c) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                placed
+            };
             out.push(rdl::Target {
                 terminal: iterm.clone(),
                 centre: ((shape.0 + shape.2) / 2, (shape.1 + shape.3) / 2),
                 shape,
                 access: Vec::new(),
+                layer: found.clone(),
             });
         }
 
@@ -1111,6 +1175,44 @@ fn rdl_wire_obstructions(
     out
 }
 
+/// **G22** — the access vias' own enclosures, which `populateObstructions` adds LAST.
+///
+/// ```text
+/// for (net, routing_pairs) in routing_targets_:
+///   for (iterm, targets) in routing_pairs:
+///     for target in targets:
+///       if  isCoverTerm(target.terminal) && bump_accessvia_ -> insert_obstruction_rect(target.shape, ...)
+///       elif !isCoverTerm(target.terminal) && pad_accessvia_ -> insert_obstruction_rect(target.shape, ...)
+/// ```
+///
+/// ⚠️ It is the TARGET's shape, not the pin's, and it is added only when the via that kind of
+/// terminal uses was actually given — a design with `-bump_via` and no `-pad_via` gets these for
+/// its bumps alone.
+fn rdl_via_obstructions(
+    db: &Db,
+    targets: &[rdl::Target],
+    bloat: i32,
+    have_bump_via: bool,
+    have_pad_via: bool,
+) -> (Vec<rdl::Obstacle>, Vec<Option<String>>) {
+    let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
+    let (mut out, mut src) = (Vec::new(), Vec::new());
+    for t in targets {
+        let Some((inst, _)) = t.terminal.rsplit_once('/') else { continue };
+        let cover = db.master_is_cover(&db.inst_get_master(inst));
+        if (cover && have_bump_via) || (!cover && have_pad_via) {
+            out.push(rdl::Obstacle::Rect(grow(t.shape)));
+            // ⛔ **The ITERM is the source, and that is the whole point.** Upstream writes
+            // `insert_obstruction_rect(target.shape, net, iterm, bloat)`, so the access-point
+            // filter — which excuses `std::get<3>(value) == target.terminal` — lets a terminal
+            // reach through its OWN via enclosure. Filing these unattributed makes every bump's
+            // via block its own access: measured, `rdl_route_bump_via` produced **0 wires**.
+            src.push(Some(t.terminal.clone()));
+        }
+    }
+    (out, src)
+}
+
 /// **G1-G5** — the RDL routing grid.
 ///
 /// ⚠️ Only the grid. The search, obstructions and rip-up are later stages, and asking for a route
@@ -1146,22 +1248,44 @@ fn rdl_route(args: &[String]) -> ExitCode {
     };
     let allow45 = opts.get("allow45").is_some();
 
-    // ⛔ **The access vias are not implemented, and are now refused rather than ignored.**
-    // `rdl_route -bump_via` / `-pad_via` name a tech via that the reference builds at every bump
-    // or pad terminal (PAD-107/108 if it is missing), which also puts the via's own enclosure into
-    // the obstruction set (`populateObstructions`' last block). This engine routes on one layer
-    // and builds neither.
-    if let Some(code) = refuse_unimplemented(
-        &opts,
-        &[
-            ("bump-via", "an access via at each bump terminal; this engine routes on one layer"),
-            ("pad-via", "an access via at each pad terminal; this engine routes on one layer"),
-        ],
-    ) {
-        return code;
-    }
-
     let layer = opts.get("layer").unwrap_or_default().to_string();
+
+    // ⛔ **`-bump_via` / `-pad_via`: the terminal's metal need not be on the routing layer.**
+    // `getOtherLayer(via)` is whichever of the via's two layers is NOT the routing layer, and
+    // `generateRoutingTargets` then accepts pin geometry there — making the via's own enclosure,
+    // recentred on the pin, the target. `writeToDb` drops the via at that end afterwards.
+    //
+    // ⚠️ PAD-107/108: the reference errors when the named tech via does not exist, rather than
+    // routing without it.
+    let other_layer_of = |v: &str| -> Option<String> {
+        for which in ["bottom", "top"] {
+            match db.tech_via_layer(v, which) {
+                Ok(l) if !l.is_empty() && l != layer => return Some(l),
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut via_err = None;
+    let mut resolve = |key: &str| -> Option<(String, String)> {
+        let v = opts.get(key)?.to_string();
+        match other_layer_of(&v) {
+            Some(l) => Some((l, v)),
+            None => {
+                via_err = Some(format!(
+                    "--{key} names `{v}`, which is not a tech via with a layer other than `{layer}`"
+                ));
+                None
+            }
+        }
+    };
+    let bump_via = resolve("bump-via");
+    let pad_via = resolve("pad-via");
+    if let Some(e) = via_err {
+        eprintln!("vyges-pad: {e}");
+        return ExitCode::from(2);
+    }
+    let access_vias = (&bump_via, &pad_via);
     let width = opts.get("width").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let spacing = opts.get("spacing").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let to_dbu = |v: f64| (v * dbu as f64).round() as i32;
@@ -1180,12 +1304,32 @@ fn rdl_route(args: &[String]) -> ExitCode {
     }
     let routing: std::collections::BTreeSet<String> = nets.iter().cloned().collect();
 
+    // ⛔ **Order: targets, then obstructions, then the graph.** `route()` runs
+    // `generateRoutingTargets` first, `populateObstructions(nets)` second — its last block reads
+    // `routing_targets_` — and `makeGraph()` only after both. So the access vias' own enclosures
+    // must be in the obstruction set before a single edge is filtered.
+    //
+    // ⚠️ Computed only when a via was actually named, so the ordinary case pays nothing for it.
+    let (via_obstacles, via_src) = if bump_via.is_some() || pad_via.is_some() {
+        let all: Vec<rdl::Target> = nets
+            .iter()
+            .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width), access_vias))
+            .collect();
+        rdl_via_obstructions(&db, &all, bloat, bump_via.is_some(), pad_via.is_some())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     // 🔑 **Two groups, kept in this order on purpose.** The instance-derived obstructions come
     // first because they are the only ones a terminal may be excused from: upstream records the
     // source object on each obstruction and the access-point filter excuses exactly
     // `std::get<3>(value) == target.terminal`. A special wire and a block obstruction are stored
     // with a null source, so they are never excused — see `access_own` below.
-    let (mut obstructions, obstacle_src) = rdl_obstructions(&db, &layer, bloat);
+    let (mut obstructions, mut obstacle_src) = rdl_obstructions(&db, &layer, bloat);
+    // ⚠️ The via enclosures join the ATTRIBUTABLE group, before the prefix is measured — they carry
+    // a source terminal and must be excusable for it.
+    obstructions.extend(via_obstacles);
+    obstacle_src.extend(via_src);
     let instance_obstructions = obstructions.len();
     obstructions.extend(rdl_wire_obstructions(&db, &layer, bloat, &routing));
     let clear = rdl::edges_clear(&g, allow45, &|a, b| rdl::blocked(a, b, &obstructions));
@@ -1208,7 +1352,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let mut target_report = String::new();
     let mut total_targets = 0usize;
     for n in &nets {
-        let t = rdl_targets(&db, n, &layer, to_dbu(width));
+        let t = rdl_targets(&db, n, &layer, to_dbu(width), access_vias);
         let iterms: std::collections::BTreeSet<&String> =
             t.iter().map(|x| &x.terminal).collect();
         total_targets += t.len();
@@ -1219,7 +1363,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut routes: Vec<rdl::Route> = Vec::new();
         let mut ties = 0usize;
         for (i, n) in nets.iter().enumerate() {
-            let targets = rdl_targets(&db, n, &layer, to_dbu(width));
+            let targets = rdl_targets(&db, n, &layer, to_dbu(width), access_vias);
             // One Dest per terminal for the ORDERING question, which is about terminals rather
             // than targets; the router itself keeps every target (see `access`).
             let mut seen = std::collections::BTreeSet::new();
@@ -1307,7 +1451,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         // The reference logs TARGET centres, so report those rather than the ordering centres.
         let target_of: std::collections::HashMap<String, (i32, i32)> = nets
             .iter()
-            .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width)))
+            .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width), access_vias))
             .map(|t| (t.terminal, t.centre))
             .collect();
         let body: String = routes
@@ -1345,6 +1489,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 centre,
                 shape: (centre.0, centre.1, centre.0, centre.1),
                 access: Vec::new(),
+                layer: layer.clone(),
             };
             let snaps = rdl::access_points(&g, &t, &obstructions, &own);
             rdl::insert_access(&mut graph, &g, centre, &snaps, allow45, &|a, b| {
@@ -1433,7 +1578,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             // The pin rectangles the two ends land on, so the end runs can reach into them.
             let shape_of = |c: (i32, i32)| {
                 nets.iter()
-                    .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width)))
+                    .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width), access_vias))
                     .find(|t| t.centre == c)
                     .map(|t| t.shape)
                     .unwrap_or((c.0, c.1, c.0, c.1))
@@ -1523,7 +1668,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     if let Some(path) = opts.get("net-centre-report") {
         let mut body = String::new();
         for n in &nets {
-            for t in rdl_targets(&db, n, &layer, to_dbu(width)) {
+            for t in rdl_targets(&db, n, &layer, to_dbu(width), access_vias) {
                 body.push_str(&format!("{n} {} {} {}\n", t.centre.0, t.centre.1, t.terminal));
             }
         }
@@ -1535,7 +1680,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     if let Some(path) = opts.get("centre-report") {
         let mut all = std::collections::BTreeSet::new();
         for n in &nets {
-            for t in rdl_targets(&db, n, &layer, to_dbu(width)) {
+            for t in rdl_targets(&db, n, &layer, to_dbu(width), access_vias) {
                 all.insert(t.centre);
             }
         }
@@ -1592,10 +1737,14 @@ fn rdl_route(args: &[String]) -> ExitCode {
     // must be clipped against is the one belonging to the target the router actually reached.
     let mut shape_of: std::collections::HashMap<rdl::Point, (i32, i32, i32, i32)> =
         std::collections::HashMap::new();
+    // Which layer each target's pin metal is on, and whose terminal it is — `writeToDb` keys the
+    // end-of-segment via off exactly this.
+    let mut target_layer: std::collections::HashMap<rdl::Point, (String, String)> =
+        std::collections::HashMap::new();
     let mut routes: Vec<rdl::Route> = Vec::new();
 
     for n in &nets {
-        let targets = rdl_targets(&db, n, &layer, to_dbu(width));
+        let targets = rdl_targets(&db, n, &layer, to_dbu(width), access_vias);
         let mut dests: Vec<rdl::Dest> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for t in &targets {
@@ -1620,6 +1769,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 .1
                 .push((t.centre, snaps));
             shape_of.insert(t.centre, t.shape);
+            target_layer.insert(t.centre, (t.layer.clone(), t.terminal.clone()));
             if !seen.insert(t.terminal.clone()) {
                 continue;
             }
@@ -1856,6 +2006,21 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 // single swire emits a different file for identical geometry.
                 db.new_swire(net, opts.get("fixed").is_some())
                     .map_err(|e| format!("{net}: {e}"))?;
+                // ⛔ **Vias LAST, after the route's wires** — `writeToDb` emits them at the very
+                // end of the segment, once per end whose target sits on the other layer.
+                let end_via = |c: Option<&rdl::Point>| -> Option<(rdl::Point, String)> {
+                    let c = *c?;
+                    let (tl, term) = target_layer.get(&c)?;
+                    if *tl == layer {
+                        return None;
+                    }
+                    let (inst, _) = term.rsplit_once('/')?;
+                    let cover = db.master_is_cover(&db.inst_get_master(inst));
+                    let v = if cover { bump_via.as_ref() } else { pad_via.as_ref() }?;
+                    Some((c, v.1.clone()))
+                };
+                let vias: Vec<(rdl::Point, String)> =
+                    [end_via(path.first()), end_via(path.last())].into_iter().flatten().collect();
                 for piece in rdl::wires(path, w, s, t) {
                     // ⛔ **BOTH kinds, and a diagonal is not a rectangle.** The reference writes an
                     // axis-aligned run as a bounding box and a 45 through a different
@@ -1879,6 +2044,10 @@ fn rdl_route(args: &[String]) -> ExitCode {
                             )
                             .map_err(|e| format!("cannot write a 45 wire on {net}: {e}"))?,
                     }
+                }
+                for (at, v) in vias {
+                    db.add_swire_via(net, &v, at, opts.get("fixed").is_some(), "IOWIRE")
+                        .map_err(|e| format!("cannot write an access via on {net}: {e}"))?;
                 }
             }
             Ok(())
