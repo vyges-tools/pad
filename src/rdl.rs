@@ -1415,6 +1415,27 @@ pub struct Routed {
 /// ⚠️ Only segments that actually committed a path contribute: `updateRoute` is reached from
 /// `setRoute` and `resetRoute`, never from the `setRouted()` that `preprocess` ends in, so a locked
 /// segment is not in this graph.
+///
+/// ---
+///
+/// ⬜ **KNOWN OPEN, and this is the nearest site to it.** `rdl_route_assignments_overlapping_iterms`
+/// routes `DVDD` as **28 groups / 241 wires** where the reference gets **29 / 242** — one group
+/// short, two terminals it keeps apart that we join. Every other net and every other case matches.
+///
+/// ⛔ **Do not "fix" this by adjusting the rule below.** Making the descent narrower would split a
+/// group and score better, and it would not be the reference's rule. This exact trap has already
+/// been sprung once here: a `served` rule for locked segments improved 326 → 242 and was WRONG, on
+/// the `setRouted()` grounds stated in the paragraph above. It was reverted. Grouping via this
+/// function was then implemented faithfully and **measured inert** — the count did not move — so
+/// the cause is somewhere else and a change here would be a guess wearing a result.
+///
+/// 🔑 **Settle it in this order** (the third is the cheapest and can void the other two): build the
+/// reference twice and check 242 is even reproducible — `RDLRouter` keeps `point_vertex_map_` and
+/// `vertex_point_map_` as `std::unordered_map`, and OpenROAD #8610 records that unordered iteration
+/// makes exact-output tests disagree between builds. Then `-debug PAD Router 2` on that one case
+/// and diff its 29 groups against our 28. Then read the grouping call sequence against that trace.
+/// Full record, including the eight candidates already eliminated by measurement rather than by
+/// argument: `vyges-tools-internal/docs/openroad/pad/pad-audit.md` finding 31.
 pub fn routed_pairs(routes: &[Route]) -> std::collections::HashMap<&str, Vec<&str>> {
     let mut adj: std::collections::HashMap<&str, Vec<&str>> = Default::default();
     for r in routes {
