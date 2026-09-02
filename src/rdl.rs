@@ -1376,6 +1376,50 @@ pub fn is_routed(adj: &std::collections::HashMap<&str, Vec<&str>>, source: &str,
     false
 }
 
+/// Does the point lie ON the segment `a`–`b`?
+///
+/// `RDLSegment::isIntersecting(line, 0)` tests the line against
+/// `getPointObstruction(pt, 0)` — a rectangle of side zero, i.e. the point itself — so this is
+/// exactly "the line passes through that route vertex", endpoints included.
+fn point_on_segment(pt: Point, a: Point, b: Point) -> bool {
+    let cross = (b.0 as i64 - a.0 as i64) * (pt.1 as i64 - a.1 as i64)
+        - (b.1 as i64 - a.1 as i64) * (pt.0 as i64 - a.0 as i64);
+    cross == 0
+        && pt.0 >= a.0.min(b.0)
+        && pt.0 <= a.0.max(b.0)
+        && pt.1 >= a.1.min(b.1)
+        && pt.1 <= a.1.max(b.1)
+}
+
+/// **L10** — `removeTerminalAccess` puts back what it took, but **with the checks ON**.
+///
+/// ⛔ **The two undo paths differ, and only in their last two arguments:**
+///
+/// ```text
+/// uncommitRoute:         addGraphEdge(p0,  p1,  scale, false, false);   // always restored
+/// removeTerminalAccess:  addGraphEdge(pt0, pt1, scale, true,  true);    // CHECKED
+/// ```
+///
+/// So an edge that was removed to make room for a terminal's access is put back only if it is
+/// still clear — of obstructions, and of every committed route. One that has come to conflict is
+/// **never restored**, and the graph loses that resource for the rest of the run.
+///
+/// ⚠️ `check_routes` reaches `RDLSegment::isIntersecting(line, 0)`, which is the line against each
+/// route vertex, not against the whole corridor.
+pub fn undo_access(graph: &mut Graph, undo: &Undo, blocked_edge: &dyn Fn(Point, Point) -> bool) {
+    for &(a, b) in &undo.cut {
+        graph.cut(a, b);
+    }
+    for &(a, b, scale) in &undo.restore {
+        let (pa, pb) = (graph.points[a], graph.points[b]);
+        if blocked_edge(pa, pb) {
+            continue;
+        }
+        let w = edge_weight(pa, pb, scale);
+        graph.join(a, b, w);
+    }
+}
+
 /// **L8** — is this access point too close to a route already committed?
 ///
 /// Compares the box of `(width + spacing) / 2` around the point against the same-sized box around
@@ -1547,8 +1591,19 @@ pub fn route_all(
                 // access first leaves those edges in place and the next route may run straight
                 // past a terminal another route is already using.
                 committed[i] = Some(commit_route(graph, &path, width, spacing, allow45));
-                graph.undo(&b);
-                graph.undo(&a);
+                // ⛔ **Terminal access is undone with the CHECKS ON** — see `undo_access`. The
+                // route just committed is part of what those checks see, which is why this runs
+                // AFTER `commit_route`.
+                let settled: Vec<&[Point]> =
+                    routes.iter().filter(|r| r.routed).map(|r| r.points.as_slice()).collect();
+                let mut settled = settled;
+                settled.push(path.as_slice());
+                let checked = |p0: Point, p1: Point| -> bool {
+                    obstructed(p0, p1)
+                        || settled.iter().any(|pts| pts.iter().any(|&pt| point_on_segment(pt, p0, p1)))
+                };
+                undo_access(graph, &b, &checked);
+                undo_access(graph, &a, &checked);
                 laid_path = Some((*s_centre, *d_centre, path));
                 break;
             }
@@ -2451,6 +2506,48 @@ mod write_order_tests {
             locked: false,
             stubs: Vec::new(),
         }
+    }
+
+    /// ⛔ **`removeTerminalAccess` restores with the CHECKS ON.** An edge taken out to make room
+    /// for a terminal's access comes back only if it is still clear; one that a committed route now
+    /// crosses is never restored, and the graph loses it for the rest of the run.
+    ///
+    /// 🔑 The two undo paths differ only in those flags — `uncommitRoute` passes
+    /// `false, false` and always restores — so a single unconditional `undo` for both is the
+    /// mistake this pins.
+    #[test]
+    fn an_access_edge_a_route_now_crosses_is_never_restored() {
+        let mut g = Graph::default();
+        let a = g.vertex((0, 0));
+        let b = g.vertex((100, 0));
+        let c = g.vertex((0, 100));
+        let d = g.vertex((100, 100));
+        g.join(a, b, 100);
+        g.join(c, d, 100);
+
+        // Take both out, the way inserting terminal access does.
+        let mut undo = Undo::default();
+        for (u, v) in [(a, b), (c, d)] {
+            let w = g.weight_between(u, v).unwrap();
+            undo.restore.push((u, v, restore_scale(g.points[u], g.points[v], w)));
+            g.cut(u, v);
+        }
+        assert_eq!(g.weight_between(a, b), None);
+
+        // A committed route now runs through (50, 0), which lies on a–b but not on c–d.
+        let route = [(50, 0)];
+        let blocked = |p0: Point, p1: Point| route.iter().any(|&pt| point_on_segment(pt, p0, p1));
+        undo_access(&mut g, &undo, &blocked);
+
+        assert_eq!(g.weight_between(a, b), None, "the crossed edge stays out");
+        // ⚠️ **101, not 100** — and that is the other rule, not a slip. c–d is HORIZONTAL, so it
+        // was stored with the `direction_bias`; the scale `removeGraphEdge` recovers by division
+        // carries that bias, and re-adding applies it a second time. See `restore_scale`.
+        assert_eq!(
+            g.weight_between(c, d),
+            Some(101),
+            "the clear one comes back, one unit dearer for being horizontal"
+        );
     }
 
     /// ⛔ **`RDLNet::isRouted` descends the graph; it is not a pair lookup.** A and C are never
