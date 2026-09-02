@@ -639,12 +639,24 @@ fn finish(
 }
 
 /// Write out and report a command whose result is connections rather than placements.
+/// ⛔ **`failure` is how a command says it did NOT do the job.** `route()` ends with
+///
+/// ```text
+/// const int failed_net_count = reportFailedRoutes();
+/// ... writeToDb still runs ...
+/// if (failed_net_count > 0) logger_->error(utl::PAD, 7, "Failed to route {} nets.", ...);
+/// ```
+///
+/// — the database is written **and then** the command errors. Reporting `"status": "ok"` and
+/// exiting 0 after leaving nets unrouted is the `vacuous` failure this suite reserves a word for:
+/// a pass that came from a run which did not do what was asked.
 fn finish_report(
     opts: &Opts,
     db: &mut Db,
     what: &str,
     made: &[String],
     removed: &[String],
+    failure: Option<String>,
 ) -> ExitCode {
     if !opts.dry_run {
         let out_odb = opts.get("out-odb").unwrap_or(&opts.odb).to_string();
@@ -662,8 +674,9 @@ fn finish_report(
     let quoted = |v: &[String]| {
         v.iter().map(|s| format!("\"{}\"", escape(s))).collect::<Vec<_>>().join(", ")
     };
+    let status = if failure.is_some() { "failed" } else { "ok" };
     let report = format!(
-        "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"{what}\",\n  \"status\": \"ok\",\n  \
+        "{{\n  \"tool\": \"vyges-pad\",\n  \"command\": \"{what}\",\n  \"status\": \"{status}\",\n  \
          \"connections\": {},\n  \"removed\": [{}],\n  \"made\": [{}]\n}}",
         made.len(),
         quoted(removed),
@@ -680,7 +693,13 @@ fn finish_report(
     }
     // ⚠️ Zero connections is a legitimate answer here -- a ring with nothing touching is unusual,
     // not wrong -- so this does not take the empty-result exit code the placement path uses.
-    ExitCode::SUCCESS
+    match failure {
+        Some(why) => {
+            eprintln!("vyges-pad: {why}");
+            ExitCode::from(1)
+        }
+        None => ExitCode::SUCCESS,
+    }
 }
 
 /// ⚠️ Instance names arrive with DEF's own escaping — `u_io\\[10\\]` is one name, backslashes and
@@ -2080,7 +2099,25 @@ fn rdl_route(args: &[String]) -> ExitCode {
         done.attempts,
         done.iterations
     );
-    finish_report(&opts, &mut db, "rdl-route", &made, &done.failed)
+    // ⛔ **`reportFailedRoutes` then PAD-0007.** The count is of NETS with at least one failed
+    // segment, not of segments, and a segment whose own bump was reached by some OTHER route does
+    // not count — `getFailedRoutes` exempts it through `success_covers`, which is exactly what
+    // `rdl::failed_routes` already applies for rip-up.
+    //
+    // ⚠️ The database is written FIRST and the error raised after, so the wires that did route are
+    // kept. `rdl_route_max_iterations` is upstream's own test of this path: it `catch`es the
+    // failure and asserts the message is PAD-0007, which is why it ships no DEF golden.
+    let failed_nets: std::collections::BTreeSet<&str> = rdl::failed_routes(&routes)
+        .into_iter()
+        .filter_map(|i| access.get(&routes[i].source).map(|(n, _)| n.as_str()))
+        .collect();
+    let failure = (!failed_nets.is_empty()).then(|| {
+        for n in &failed_nets {
+            eprintln!("vyges-pad: could not route {n}");
+        }
+        format!("failed to route {} nets", failed_nets.len())
+    });
+    finish_report(&opts, &mut db, "rdl-route", &made, &done.failed, failure)
 }
 
 /// **B1** — assign a net to a bump.
@@ -2202,7 +2239,7 @@ fn assign_io_bump(args: &[String]) -> ExitCode {
     if let Some(t) = &plan.terminal {
         made.push(format!("{t} -> {net}"));
     }
-    finish_report(&opts, &mut db, "bump-assignment", &made, &[])
+    finish_report(&opts, &mut db, "bump-assignment", &made, &[], None)
 }
 
 /// **T1** — give each named pad terminal a block terminal on the die's top routing layer.
@@ -2287,7 +2324,7 @@ fn place_io_terminals(args: &[String]) -> ExitCode {
         }
         made.push(format!("{id} -> {net}"));
     }
-    finish_report(&opts, &mut db, "io-terminals", &made, &[])
+    finish_report(&opts, &mut db, "io-terminals", &made, &[], None)
 }
 
 /// **F2** — pack the gaps in one row with filler cells.
@@ -2621,7 +2658,7 @@ fn connect_ring(args: &[String]) -> ExitCode {
         .iter()
         .map(|((i, t), net)| format!("{}/{} -> {net}", insts[*i].name, insts[*i].terms[*t].name))
         .collect();
-    finish_report(&opts, &mut db, "abutment", &touched, &plan.destroy)
+    finish_report(&opts, &mut db, "abutment", &touched, &plan.destroy, None)
 }
 
 /// Marks an error as "this engine does not implement that", which exits 3 rather than 2.
