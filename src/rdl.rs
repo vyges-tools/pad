@@ -1158,6 +1158,12 @@ pub struct Route {
     pub pending: bool,
     /// The path committed for this route, empty when it is not routed.
     pub points: Vec<Point>,
+    /// **`RDLSegment::preprocess` locked this segment**: its terminals already touch, so it is
+    /// marked routed before the queue is built and is never attempted.
+    pub locked: bool,
+    /// The stubs that bridge a sub-spacing gap, written INSTEAD of a route. Empty when the shapes
+    /// simply overlap — that case writes no wire at all, not even a swire.
+    pub stubs: Vec<Rect>,
 }
 
 /// Squared distance — exact in integers, and all the ordering rules need.
@@ -1363,7 +1369,10 @@ pub fn route_all(
 ) -> Routed {
     let mut out = Routed::default();
     let mut committed: Vec<Option<Undo>> = vec![None; routes.len()];
-    let mut queue: Vec<usize> = (0..routes.len()).collect();
+    // ⛔ **Upstream seeds the queue with `if (!segment->isRouted()) route_queue.push(...)`.**
+    // `preprocess` runs before this and marks a segment routed when its terminals already touch,
+    // so such a segment is never attempted — and never reported failed either.
+    let mut queue: Vec<usize> = (0..routes.len()).filter(|&i| !routes[i].routed).collect();
     let mut last_done: std::collections::BTreeSet<String> = Default::default();
 
     loop {
@@ -1386,10 +1395,18 @@ pub fn route_all(
                 }
                 let cand = routes[i].dests[routes[i].next].clone();
                 routes[i].next += 1;
+                // ⛔ **A segment `preprocess` LOCKED counts as routed here too.** `setRouted()`
+                // makes `updateRoute` register the pair, and it inserts the destination into
+                // `routed_noncover_terminals_` when that destination is not a cover term — so no
+                // other bump will route to a pad whose own bump already touches it. Requiring a
+                // committed path instead lets a second bump claim that pad and shifts every route
+                // after it: measured on `_overlapping_iterms`, DVDD went to 325 wires against 240.
                 let served = !cand.cover
                     && routes.iter().any(|r| {
-                        r.routed && r.points.len() > 1 && r.dests.get(r.next.saturating_sub(1))
-                            .is_some_and(|x| x.terminal == cand.terminal)
+                        r.routed
+                            && (r.points.len() > 1 || r.locked)
+                            && r.dests.get(r.next.saturating_sub(1))
+                                .is_some_and(|x| x.terminal == cand.terminal)
                     });
                 let reversed = routes.iter().any(|r| {
                     r.routed
@@ -1547,7 +1564,10 @@ pub fn route_all(
     // index the served/reversed checks read.
     out.paths = routes
         .iter()
-        .filter(|r| r.routed)
+        // ⚠️ A LOCKED segment is `routed` and has a destination recorded, but it committed no
+        // path. It must not appear here: the writer walks `routes` and `paths` in step, so an
+        // entry with no wires would leave the two out of alignment for everything after it.
+        .filter(|r| r.routed && !r.locked)
         .filter_map(|r| {
             let d = r.dests.get(r.next.checked_sub(1)?)?;
             let net = access.get(&r.source)?.0.clone();
@@ -1638,6 +1658,8 @@ mod tests {
             routed: false,
             pending: true,
             points: Vec::new(),
+            locked: false,
+            stubs: Vec::new(),
         }
     }
 
@@ -2368,6 +2390,8 @@ mod write_order_tests {
             routed: false,
             pending: true,
             points: Vec::new(),
+            locked: false,
+            stubs: Vec::new(),
         }
     }
 

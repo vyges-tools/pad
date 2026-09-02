@@ -1248,6 +1248,8 @@ fn rdl_route(args: &[String]) -> ExitCode {
                     routed: false,
                     pending: true,
                     points: Vec::new(),
+                    locked: false,
+                    stubs: Vec::new(),
                 });
             }
             let has_non_cover =
@@ -1658,6 +1660,8 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 routed: false,
                 pending: true,
                 points: Vec::new(),
+                locked: false,
+                stubs: Vec::new(),
             });
         }
         // ⛔ **`RDLNet::finalizeSegments` — a net of nothing but bumps routes N-1 segments.**
@@ -1675,6 +1679,75 @@ fn rdl_route(args: &[String]) -> ExitCode {
             routes.pop();
         }
     }
+    // ⛔ **`RDLSegment::preprocess`** — `route()` runs this between `buildIntialRouteSet()` and
+    // filling the queue, so a segment it marks routed is **never attempted**:
+    //
+    // ```text
+    // buildIntialRouteSet();
+    // for route: for segment:  segment->preprocess(layer_, logger_);
+    // ...
+    // for route: for segment:  if (!segment->isRouted()) route_queue.push(segment.get());
+    // ```
+    //
+    // Two rules, in order, over `iterms_geoms` — an `odb::PtrMap`, so **ascending iterm id**, and
+    // it returns on the FIRST destination that matches:
+    //   1. the shapes already interact -> locked, and **no wire of any kind** is written;
+    //   2. they interact once bloated by the LAYER's spacing -> locked, with **stubs** bridging
+    //      the gap instead of a route.
+    //
+    // ⚠️ `min_dist` is `layer->getSpacing()`, the layer's own rule — not the command's `-spacing`.
+    //
+    // 🔑 The geometry is BOUND, not reimplemented: `interact` is touch connectivity, so two shapes
+    // sharing an edge with zero gap interact while their intersection is empty. See
+    // `vyges_opendb::rdl_preprocess` and `vyges-tools-opendb/tests/rdl_preprocess.rs`.
+    {
+        let min_dist = db.layer_get_spacing(&layer);
+        let boxes = |term: &str| -> Vec<(i32, i32, i32, i32)> {
+            let Some((inst, pin)) = term.rsplit_once('/') else { return Vec::new() };
+            db.iterm_pin_boxes(inst, pin)
+                .into_iter()
+                .filter(|b| !b.is_via && db.layer_name_by_number(b.layer) == layer)
+                .map(|b| (b.x0, b.y0, b.x1, b.y1))
+                .collect()
+        };
+        for r in routes.iter_mut() {
+            let source = boxes(&r.source);
+            // ⚠️ `preprocess` returns early when the source has no shape on the layer at all.
+            if source.is_empty() {
+                continue;
+            }
+            let mut by_id: Vec<&rdl::Dest> = r.dests.iter().collect();
+            by_id.sort_by_key(|d| d.id);
+            for d in by_id {
+                let dest = boxes(&d.terminal);
+                if dest.is_empty() {
+                    break; // the reference returns outright when a destination has no shape here
+                }
+                let Ok((verdict, stubs)) = vyges_opendb::rdl_preprocess(&source, &dest, min_dist)
+                else {
+                    break;
+                };
+                if verdict == 0 {
+                    continue;
+                }
+                r.locked = true;
+                r.routed = true; // `setRouted()` — so it is neither queued nor reported failed
+                r.stubs = stubs;
+                // ⚠️ Point `next` past the destination that matched, because everything downstream
+                // reads the pair a route settled on as `dests[next - 1]` — that is how
+                // `updateRoute` registers a locked segment's terminals.
+                if let Some(k) = r.dests.iter().position(|x| x.terminal == d.terminal) {
+                    r.next = k + 1;
+                }
+                if std::env::var("VYGES_PAD_TRACE").is_ok() {
+                    eprintln!("preprocess lock {} -> {} verdict {verdict} stubs {}",
+                              r.source, d.terminal, r.stubs.len());
+                }
+                break;
+            }
+        }
+    }
+
     // The access lines themselves: one line per `centre -> snap` pair. `populateTerminalAccessPoints`
     // tests every one of these against the grid edges it crosses, and this dumps them so that test
     // can be reproduced outside the engine before it is built into it.
@@ -1715,7 +1788,35 @@ fn rdl_route(args: &[String]) -> ExitCode {
             for net in done.paths.iter().map(|(n, ..)| n.clone()).collect::<std::collections::BTreeSet<_>>() {
                 db.clear_routed_swires(&net).map_err(|e| format!("{net}: {e}"))?;
             }
-            for (net, _src, _dst, path) in &done.paths {
+            // ⛔ **Stubs are written in SEGMENT DECLARATION ORDER, interleaved with the routes.**
+            // `writeToDb` runs per segment over `routes_`, and a locked segment still reaches it:
+            // with `source == nullptr && target == nullptr` it returns early **unless `stubs` is
+            // non-empty**, in which case it creates that segment's own `dbSWire` and writes the
+            // stub rectangles into it and nothing else. So a stub segment occupies its place in
+            // the swire sequence, and an overlapping one occupies none at all.
+            //
+            // ⚠️ `done.paths` is already in declaration order and a locked route falls out of it
+            // (its `next` is 0), so walking `routes` and consuming `paths` in step reproduces the
+            // interleaving without a second ordering rule.
+            let mut path_iter = done.paths.iter().peekable();
+            for r in routes.iter() {
+                if r.locked {
+                    if r.stubs.is_empty() {
+                        continue; // shapes overlap: no swire, no wire
+                    }
+                    let Some((net, _)) = access.get(&r.source) else { continue };
+                    make_special(&mut db, net)?;
+                    db.new_swire(net, opts.get("fixed").is_some())
+                        .map_err(|e| format!("{net}: {e}"))?;
+                    for &stub in &r.stubs {
+                        db.add_swire_box(net, &layer, stub, opts.get("fixed").is_some())
+                            .map_err(|e| format!("cannot write a stub on {net}: {e}"))?;
+                    }
+                    continue;
+                }
+                let Some((net, _src, _dst, path)) = path_iter.next_if(|p| p.1 == r.source) else {
+                    continue;
+                };
                 // ⚠️ The shapes to clip against are the ones of the targets the router actually
                 // reached — the path's own endpoints — not the terminal's first target.
                 let s = path.first().and_then(|p| shape_of.get(p)).copied().unwrap_or_default();
