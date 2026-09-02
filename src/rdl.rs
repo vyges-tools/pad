@@ -1395,18 +1395,22 @@ pub fn route_all(
                 }
                 let cand = routes[i].dests[routes[i].next].clone();
                 routes[i].next += 1;
-                // ⛔ **A segment `preprocess` LOCKED counts as routed here too.** `setRouted()`
-                // makes `updateRoute` register the pair, and it inserts the destination into
-                // `routed_noncover_terminals_` when that destination is not a cover term — so no
-                // other bump will route to a pad whose own bump already touches it. Requiring a
-                // committed path instead lets a second bump claim that pad and shifts every route
-                // after it: measured on `_overlapping_iterms`, DVDD went to 325 wires against 240.
+                // ⛔ **A segment `preprocess` LOCKED does NOT count as served, and it is worth
+                // saying why the opposite is tempting.** `preprocess` ends in `setRouted()`, which
+                // sets the flag and recomputes the bbox and nothing else — `net_->updateRoute` is
+                // reached only from `setRoute` and `resetRoute`. So a locked segment never enters
+                // `routed_pairs_` or `routed_noncover_terminals_`, and other bumps go on offering
+                // its pad as a destination.
+                //
+                // ⚠️ Measured on `_overlapping_iterms`: counting a locked segment as served makes
+                // us skip **nine** attempts at `u_v18_25/DVDD` that the reference makes, and it
+                // *improves* the wire count while doing it. A rule that scores better and is not
+                // the reference's is the worst kind, because everything downstream is then
+                // attributed to it.
                 let served = !cand.cover
                     && routes.iter().any(|r| {
-                        r.routed
-                            && (r.points.len() > 1 || r.locked)
-                            && r.dests.get(r.next.saturating_sub(1))
-                                .is_some_and(|x| x.terminal == cand.terminal)
+                        r.routed && r.points.len() > 1 && r.dests.get(r.next.saturating_sub(1))
+                            .is_some_and(|x| x.terminal == cand.terminal)
                     });
                 let reversed = routes.iter().any(|r| {
                     r.routed
