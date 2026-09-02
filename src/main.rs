@@ -46,6 +46,7 @@ const USAGE: &str = "\
 vyges physical pad — IO pad and bump placement: the ring around the die, and what sits in it
 
 USAGE:
+  vyges physical pad make-fake-io-site <design.odb> --name N --width W --height H  (microns)
   vyges physical pad make-io-sites  <design.odb> --horizontal-site S --vertical-site S
                                 --corner-site S --offset D [options]
   vyges physical pad place-corners  <design.odb> --master M [--ring-index N] [options]
@@ -133,10 +134,10 @@ const DESCRIBE: &str = r#"{
   "maturity": "partial",
   "provenance_limitations": [
       "input_hash covers the argument vector, not the content of the .odb it names.",
-      "SCOPE: every command listed in --help is implemented and dispatched -- the ring (`make-io-sites`), corner and pad placement (`place-corners`, `place-pad`, `place-pads`), IO fill, bond pads, terminals, the bump array and its removal, bump assignment, connection by abutment, and RDL routing. WHAT DIFFERS ACROSS THEM IS EVIDENCE, NOT EXISTENCE: the ring and corner/pad placement are measured against upstream cases (see MEASURED below); the rest are tested but not yet scored against a reference. An earlier version of this line claimed five of these were `not implemented` long after they shipped -- read a scope claim as a statement about EVIDENCE and check it against --help, which is generated from the same dispatch.",
+      "SCOPE: every command listed in --help is implemented and dispatched -- the fake IO site (`make-fake-io-site`), the ring (`make-io-sites`), corner and pad placement (`place-corners`, `place-pad`, `place-pads`), IO fill, bond pads, terminals, the bump array and its removal, bump assignment, connection by abutment, and RDL routing. WHAT DIFFERS ACROSS THEM IS EVIDENCE, NOT EXISTENCE: the ring and corner/pad placement are measured against upstream cases (see MEASURED below); the rest are tested but not yet scored against a reference. An earlier version of this line claimed five of these were `not implemented` long after they shipped -- read a scope claim as a statement about EVIDENCE and check it against --help, which is generated from the same dispatch.",
       "A cell is refused a position by a LAYER-AWARE check, not a bounding-box one: a fixed instance blocks by box refined by its OVERLAP-layer outline where either side declares one, and anything sharing a layer blocks when the moving cell's shapes, grown by that layer's spacing, reach it. A COVER master (a bump) never blocks by box -- only by shared metal.",
       "SIMPLIFICATION: shape nets are not carried, so two shapes on the same net are treated as a conflict. The reference lets them touch. A cell being created has no nets, which is why every supported case is unaffected; a command placing already-connected cells would need them.",
-      "ABSENCE, stated because the SCOPE line above lists what EXISTS and is therefore silent about what does not. Two of upstream's fifteen commands have no counterpart here: `make_fake_io_site` (upstream's own corpus exercises it 4 times) and `remove_io_rows` (which upstream ships and nothing tests). Three OPTIONS of commands that do exist are not honoured: `rdl-route --bump-via` and `--pad-via` name an access via this engine does not build and are now REFUSED with exit 3 rather than accepted and ignored; `assign-io-bump --dont-route` writes nothing, which is faithful -- upstream stores it only in `ICeWall::routing_map_`, a member of the command object -- but it therefore cannot reach `rdl-route`, which is a separate process here, so a bump upstream would leave alone is routed. Upstream has the same hole across its own `write_db`.",
+      "ABSENCE, stated because the SCOPE line above lists what EXISTS and is therefore silent about what does not. ONE of upstream's fifteen commands has no counterpart here: `remove_io_rows`, which upstream ships and nothing tests. `make_fake_io_site` WAS also absent and is now implemented as `make-fake-io-site`, which is what unblocks the two largest pad designs upstream ships -- `skywater130_caravel` and `skywater130_coyote_tc` both open with it. Three OPTIONS of commands that do exist are not honoured: `rdl-route --bump-via` and `--pad-via` name an access via this engine does not build and are now REFUSED with exit 3 rather than accepted and ignored; `assign-io-bump --dont-route` writes nothing, which is faithful -- upstream stores it only in `ICeWall::routing_map_`, a member of the command object -- but it therefore cannot reach `rdl-route`, which is a separate process here, so a bump upstream would leave alone is routed. Upstream has the same hole across its own `write_db`.",
       "RDL ROUTING is implemented here (`rdl-route`), not deferred elsewhere: bumps are connected to pads across the face of the die on one thick layer, over a graph built from that layer track grid and thinned so neighbouring wires cannot come closer than the requested spacing. This limitation previously said the router was deliberately out of scope, which stopped being true when it was built.",
       "The ring is the die area inset by the offset, corners sized from the corner site, and four edges truncated to WHOLE sites -- a remainder that does not fill a site is given up rather than rounded out.",
       "A corner's WIDTH is the larger of the corner site's width and the horizontal row's depth, so the row abutting it can be what sets the corner size.",
@@ -511,6 +512,51 @@ fn place_corners(args: &[String]) -> ExitCode {
         placed.push(p);
     }
     finish(&opts, &mut db, "corners", &placed, &skipped)
+}
+
+/// `make_fake_io_site` — a PAD-class site for a ring whose LEF defines no IO site of its own.
+///
+/// 🔑 **`ICeWall::makeFakeSite` is four lines and the call SEQUENCE is the whole command.** It runs
+/// BEFORE `make_io_sites`, which then resolves `-horizontal_site`/`-vertical_site`/`-corner_site`
+/// by name across every library — so the site this creates in `FAKE_IO` is found exactly as a
+/// LEF-defined one is. `skywater130_caravel` and `skywater130_coyote_tc` each open with two of
+/// these and place their entire ring on them.
+///
+/// ⚠️ **Microns in, database units down.** Upstream's Tcl wrapper converts with
+/// `ord::microns_to_dbu` before the C++ sees anything, so the conversion belongs at this boundary.
+/// Passing microns through would make a 100 µm site 100 DBU wide and the ring would collapse
+/// silently — a wrong ring, not an error.
+fn make_fake_io_site(args: &[String]) -> ExitCode {
+    let (opts, mut db) = match open(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let dbu = db.dbu_per_micron();
+
+    let built = (|| -> Result<String, String> {
+        let name = opts.need("name")?.to_string();
+        let um = |k: &str| -> Result<i32, String> {
+            let v: f64 = opts.need(k)?.parse().map_err(|_| format!("--{k} wants microns"))?;
+            Ok((v * dbu as f64).round() as i32)
+        };
+        let (w, h) = (um("width")?, um("height")?);
+        if w <= 0 || h <= 0 {
+            return Err("--width and --height must be positive".into());
+        }
+        if !opts.dry_run {
+            db.create_fake_site(&name, w, h).map_err(|e| format!("cannot create site {name}: {e}"))?;
+        }
+        Ok(format!("{name}: {w} x {h} dbu"))
+    })();
+
+    let made = match built {
+        Ok(v) => vec![v],
+        Err(e) => {
+            eprintln!("vyges-pad: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    finish_report(&opts, &mut db, "fake-io-site", &made, &[], None)
 }
 
 /// **C1–C4** — one pad at a location along a row.
@@ -3465,6 +3511,7 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
+        Some("make-fake-io-site") => make_fake_io_site(&args[1..]),
         Some("make-io-sites") => make_io_sites(&args[1..]),
         Some("place-corners") => place_corners(&args[1..]),
         Some("place-pad") => place_pad(&args[1..]),
@@ -3609,13 +3656,20 @@ mod pin_tests {
             .iter()
             .find(|t| t.starts_with("ABSENCE"))
             .expect("the descriptor must carry an ABSENCE limitation, not only a SCOPE one");
-        for missing in ["make_fake_io_site", "remove_io_rows", "--bump-via", "--pad-via",
-                        "--dont-route"] {
+        // ⛔ `make_fake_io_site` came OFF this list when it shipped. A descriptor that keeps
+        // claiming an absence after the gap is closed is the same defect as one that claims a
+        // presence before it exists -- this engine has had both, and a test pinned the stale
+        // claim last time.
+        for missing in ["remove_io_rows", "--bump-via", "--pad-via", "--dont-route"] {
             assert!(
                 absence.contains(missing),
                 "the descriptor does not say that {missing} is missing or unhonoured"
             );
         }
+        assert!(
+            crate::USAGE.contains("make-fake-io-site"),
+            "make-fake-io-site is claimed as implemented but is not in --help"
+        );
     }
 
     #[test]
