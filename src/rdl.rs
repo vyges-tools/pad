@@ -299,6 +299,74 @@ pub struct Target {
     pub layer: String,
 }
 
+/// An obstacle together with the terminal whose own metal produced it.
+///
+/// ⛔ **The source is part of the rule, not bookkeeping.** `populateTerminalAccessPoints` discards
+/// an access line meeting an obstruction *unless* it came from the very terminal being reached —
+/// `satisfies([&target](const ObsValue& v) { return std::get<3>(v) != target.terminal; })`.
+/// Upstream carries that source in the tuple it stores; carrying it alongside in a second vector
+/// is what let a whole class of obstruction be filed with no source at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocker {
+    pub shape: Obstacle,
+    /// `None` is upstream's `nullptr` — a master obstruction, a special wire, a block obstruction.
+    /// Never excused for anyone.
+    pub src: Option<String>,
+}
+
+/// Everything the router must not run into.
+///
+/// ⛔ **There is no way to add a shape without saying where it came from.** That is the whole point
+/// of the type: the access-via enclosures were once appended straight onto a bare `Vec<Obstacle>`
+/// while their sources went into a parallel vector that the push forgot, and every bump's via then
+/// blocked its own access — `rdl_route_bump_via` produced **0 wires**. Two containers that must
+/// stay in step will eventually not.
+#[derive(Debug, Clone, Default)]
+pub struct Blockers {
+    items: Vec<Blocker>,
+    /// How many leading entries may be excused for their own terminal. Wire- and block-derived
+    /// obstructions are added after this and carry no source, matching upstream's `nullptr`.
+    excusable: usize,
+}
+
+impl Blockers {
+    pub fn push(&mut self, shape: Obstacle, src: Option<String>) {
+        self.items.push(Blocker { shape, src });
+    }
+
+    /// Everything pushed so far may be excused for its own terminal; nothing after this may.
+    pub fn seal_excusable(&mut self) {
+        self.excusable = self.items.len();
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Is the segment `p0`–`p1` blocked by anything at all?
+    pub fn blocked(&self, p0: Point, p1: Point) -> bool {
+        self.items.iter().any(|b| b.shape.hits(p0, p1))
+    }
+
+    /// The obstacles `terminal` may be excused from — **its own, by identity**.
+    pub fn own(&self, terminal: &str) -> Vec<Obstacle> {
+        self.items[..self.excusable]
+            .iter()
+            .filter(|b| b.src.as_deref() == Some(terminal))
+            .map(|b| b.shape.clone())
+            .collect()
+    }
+
+    /// Every shape, for the callers that only test geometry.
+    pub fn shapes(&self) -> Vec<Obstacle> {
+        self.items.iter().map(|b| b.shape.clone()).collect()
+    }
+}
+
 /// **G9** — the greatest usable grid coordinate strictly below `at`, and the least strictly above.
 ///
 /// ⚠️ Only coordinates that are **not** inside an obstruction take part.
@@ -323,12 +391,12 @@ pub fn nearest_tracks(axis: &[i32], at: i32, usable: &dyn Fn(i32) -> bool) -> Ve
 /// ⚠️ An obstruction belonging to **this** terminal does not count. The target sits inside its own
 /// pin metal, so every access line starts inside it; treating that as a violation would remove
 /// every access point the terminal has and make the net unroutable.
-pub fn access_points(
-    g: &Grid,
-    target: &Target,
-    obstructions: &[Obstacle],
-    own: &[Obstacle],
-) -> Vec<Point> {
+/// ⚠️ **The excused set is derived HERE, from the target's own terminal**, rather than passed in.
+/// A caller that computed it separately could compute it wrongly — geometrically instead of by
+/// identity, which is what this engine did until it routed to a pad the reference cannot reach.
+pub fn access_points(g: &Grid, target: &Target, blockers: &Blockers) -> Vec<Point> {
+    let obstructions = blockers.shapes();
+    let own = blockers.own(&target.terminal);
     let foreign = |o: &Obstacle| !own.contains(o);
     // ⚠️ **No exemption here.** A candidate track is rejected if it lies inside ANY obstruction,
     // the terminal's own metal included. The exemption applies only to the line test below. Excusing
@@ -1700,6 +1768,32 @@ pub fn route_all(
 mod tests {
     use super::*;
 
+    /// One obstacle belonging to `terminal`, and excusable for it.
+    fn blockers_own(r: Rect, terminal: &str) -> Blockers {
+        let mut b = Blockers::default();
+        b.push(Obstacle::Rect(r), Some(terminal.to_string()));
+        b.seal_excusable();
+        b
+    }
+
+    /// One obstacle belonging to somebody else — never excused.
+    fn blockers_foreign(r: Rect) -> Blockers {
+        let mut b = Blockers::default();
+        b.push(Obstacle::Rect(r), Some("other/PAD".into()));
+        b.seal_excusable();
+        b
+    }
+
+    fn blockers_wall(wall: &[Obstacle]) -> Blockers {
+        let mut b = Blockers::default();
+        for o in wall {
+            b.push(o.clone(), None);
+        }
+        b.seal_excusable();
+        b
+    }
+
+
     #[test]
     fn thinning_starts_clear_of_the_edge() {
         // width 4 -> the first track kept is the first at or beyond 3.
@@ -2025,7 +2119,7 @@ mod tests {
             access: vec![],
             layer: String::new(),
         };
-        let mut pts = access_points(&g, &t, &[], &[]);
+        let mut pts = access_points(&g, &t, &Blockers::default());
         pts.sort_unstable();
         assert_eq!(pts, vec![(100, 150), (150, 100), (150, 200), (200, 150)]);
     }
@@ -2037,8 +2131,8 @@ mod tests {
         let g = Grid { x: vec![0, 100, 200], y: vec![0, 100, 200] };
         let own = (140, 140, 160, 160);
         let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![], layer: String::new() };
-        assert_eq!(access_points(&g, &t, &[Obstacle::Rect(own)], &[Obstacle::Rect(own)]).len(), 4);
-        assert!(access_points(&g, &t, &[Obstacle::Rect(own)], &[]).is_empty(), "not excused, none survive");
+        assert_eq!(access_points(&g, &t, &blockers_own(own, &t.terminal)).len(), 4);
+        assert!(access_points(&g, &t, &blockers_foreign(own)).is_empty(), "not excused, none survive");
     }
 
     #[test]
@@ -2049,7 +2143,7 @@ mod tests {
         let g = Grid { x: vec![0, 100, 200, 300], y: vec![150] };
         let own = (90, 140, 210, 160);
         let t = Target { terminal: "u/PAD".into(), centre: (150, 150), shape: own, access: vec![], layer: String::new() };
-        let pts = access_points(&g, &t, &[Obstacle::Rect(own)], &[Obstacle::Rect(own)]);
+        let pts = access_points(&g, &t, &blockers_own(own, &t.terminal));
         assert!(!pts.contains(&(100, 150)), "inside the pad, rejected as a candidate");
         assert!(!pts.contains(&(200, 150)), "likewise");
         assert!(pts.contains(&(0, 150)) && pts.contains(&(300, 150)), "the live tracks outside");
@@ -2143,7 +2237,7 @@ mod tests {
         };
         // A wall just left of the centre blocks the westward access only.
         let wall = [Obstacle::Rect((120, 0, 130, 300))];
-        let pts = access_points(&g, &t, &wall, &[]);
+        let pts = access_points(&g, &t, &blockers_wall(&wall));
         assert!(!pts.contains(&(100, 150)), "west is blocked");
         assert!(pts.contains(&(200, 150)), "east is not");
     }

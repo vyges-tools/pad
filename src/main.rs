@@ -1044,11 +1044,7 @@ fn rdl_targets(
 /// the target's centre — excuses a NEIGHBOUR's metal that covers the pad, and the router then
 /// reaches a terminal the reference cannot. Measured on `_overlapping_iterms`: `BUMP_1_16`'s pad
 /// covers `u_v18_25`, upstream reaches it with **0** wires and we reached it with one.
-fn rdl_obstructions(
-    db: &Db,
-    layer: &str,
-    bloat: i32,
-) -> (Vec<rdl::Obstacle>, Vec<Option<String>>) {
+fn rdl_obstructions(db: &Db, layer: &str, bloat: i32) -> rdl::Blockers {
     use vyges_loom::poly90::{Poly90Set, Rect as P90Rect};
     let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
     let on_layer = |v: Vec<(i64, i32, i32, i32, i32)>| -> Vec<(i32, i32, i32, i32)> {
@@ -1060,8 +1056,7 @@ fn rdl_obstructions(
 
     let mut cache: std::collections::HashMap<String, Vec<(i32, i32, i32, i32)>> =
         std::collections::HashMap::new();
-    let mut out = Vec::new();
-    let mut src: Vec<Option<String>> = Vec::new();
+    let mut out = rdl::Blockers::default();
 
     for inst in db.inst_names() {
         if !db.inst_is_placed(&inst) {
@@ -1093,8 +1088,7 @@ fn rdl_obstructions(
             // Already bloated, so it moves onto the die unchanged.
             // ⚠️ A master obstruction has no source terminal — upstream stores `nullptr` — so it
             // is never excused for anyone.
-            out.push(rdl::Obstacle::Rect(pin_shape(r, orient, origin)));
-            src.push(None);
+            out.push(rdl::Obstacle::Rect(pin_shape(r, orient, origin)), None);
         }
 
         // ⛔ **The instance's own pin metal, at its REAL shape.** `getITermShapes` reads the two
@@ -1107,8 +1101,10 @@ fn rdl_obstructions(
         // conservative cover of it: it over-covers one corner and under-covers the opposite one.
         for term in db.master_get_m_terms(&master) {
             for r in on_layer(db.mterm_pin_boxes_excluding_polygons(&master, &term).unwrap_or_default()) {
-                out.push(rdl::Obstacle::Rect(grow(pin_shape(r, orient, origin))));
-                src.push(Some(format!("{inst}/{term}")));
+                out.push(
+                    rdl::Obstacle::Rect(grow(pin_shape(r, orient, origin))),
+                    Some(format!("{inst}/{term}")),
+                );
             }
         }
         for term in db.master_get_m_terms(&master) {
@@ -1120,12 +1116,11 @@ fn rdl_obstructions(
                 // Bloated as a polygon by the same library the reference calls; the points are
                 // already through the instance transform.
                 let ring = db.polygon_bloat(&pts, bloat).unwrap_or(pts);
-                out.push(rdl::Obstacle::from_ring(ring));
-                src.push(Some(iterm.clone()));
+                out.push(rdl::Obstacle::from_ring(ring), Some(iterm.clone()));
             }
         }
     }
-    (out, src)
+    out
 }
 
 /// **G21** — obstructions that come from the DATABASE rather than from a placed instance:
@@ -1157,9 +1152,9 @@ fn rdl_wire_obstructions(
     layer: &str,
     bloat: i32,
     routing: &std::collections::BTreeSet<String>,
-) -> Vec<rdl::Obstacle> {
+    out: &mut rdl::Blockers,
+) {
     let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
-    let mut out = Vec::new();
     for net in db.net_names() {
         let is_routing = routing.contains(&net);
         for (l, fixed, oct, x0, y0, x1, y1, w) in
@@ -1175,13 +1170,12 @@ fn rdl_wire_obstructions(
                 // ⚠️ `odb::Oct::bloat(margin)` keeps the endpoints and rebuilds at
                 // `2 * (A + margin)`, where `A` is the stored `width / 2` — INTEGER division, so
                 // on an odd width this is not `width + 2 * margin`.
-                out.push(rdl::Obstacle::from_ring(rdl::oct_points(
-                    (x0, y0),
-                    (x1, y1),
-                    2 * (w / 2 + bloat),
-                )));
+                out.push(
+                    rdl::Obstacle::from_ring(rdl::oct_points((x0, y0), (x1, y1), 2 * (w / 2 + bloat))),
+                    None,
+                );
             } else {
-                out.push(rdl::Obstacle::Rect(grow((x0, y0, x1, y1))));
+                out.push(rdl::Obstacle::Rect(grow((x0, y0, x1, y1))), None);
             }
         }
     }
@@ -1189,9 +1183,8 @@ fn rdl_wire_obstructions(
         if db.layer_name_by_number(l) != layer {
             continue;
         }
-        out.push(rdl::Obstacle::Rect(grow((x0, y0, x1, y1))));
+        out.push(rdl::Obstacle::Rect(grow((x0, y0, x1, y1))), None);
     }
-    out
 }
 
 /// **G22** — the access vias' own enclosures, which `populateObstructions` adds LAST.
@@ -1213,23 +1206,21 @@ fn rdl_via_obstructions(
     bloat: i32,
     have_bump_via: bool,
     have_pad_via: bool,
-) -> (Vec<rdl::Obstacle>, Vec<Option<String>>) {
+    out: &mut rdl::Blockers,
+) {
     let grow = |r: (i32, i32, i32, i32)| (r.0 - bloat, r.1 - bloat, r.2 + bloat, r.3 + bloat);
-    let (mut out, mut src) = (Vec::new(), Vec::new());
     for t in targets {
         let Some((inst, _)) = t.terminal.rsplit_once('/') else { continue };
         let cover = db.master_is_cover(&db.inst_get_master(inst));
         if (cover && have_bump_via) || (!cover && have_pad_via) {
-            out.push(rdl::Obstacle::Rect(grow(t.shape)));
+            out.push(rdl::Obstacle::Rect(grow(t.shape)), Some(t.terminal.clone()));
             // ⛔ **The ITERM is the source, and that is the whole point.** Upstream writes
             // `insert_obstruction_rect(target.shape, net, iterm, bloat)`, so the access-point
             // filter — which excuses `std::get<3>(value) == target.terminal` — lets a terminal
             // reach through its OWN via enclosure. Filing these unattributed makes every bump's
             // via block its own access: measured, `rdl_route_bump_via` produced **0 wires**.
-            src.push(Some(t.terminal.clone()));
         }
     }
-    (out, src)
 }
 
 /// **G1-G5** — the RDL routing grid.
@@ -1329,14 +1320,12 @@ fn rdl_route(args: &[String]) -> ExitCode {
     // must be in the obstruction set before a single edge is filtered.
     //
     // ⚠️ Computed only when a via was actually named, so the ordinary case pays nothing for it.
-    let (via_obstacles, via_src) = if bump_via.is_some() || pad_via.is_some() {
-        let all: Vec<rdl::Target> = nets
-            .iter()
+    let via_targets: Vec<rdl::Target> = if bump_via.is_some() || pad_via.is_some() {
+        nets.iter()
             .flat_map(|n| rdl_targets(&db, n, &layer, to_dbu(width), access_vias))
-            .collect();
-        rdl_via_obstructions(&db, &all, bloat, bump_via.is_some(), pad_via.is_some())
+            .collect()
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
 
     // 🔑 **Two groups, kept in this order on purpose.** The instance-derived obstructions come
@@ -1344,30 +1333,17 @@ fn rdl_route(args: &[String]) -> ExitCode {
     // source object on each obstruction and the access-point filter excuses exactly
     // `std::get<3>(value) == target.terminal`. A special wire and a block obstruction are stored
     // with a null source, so they are never excused — see `access_own` below.
-    let (mut obstructions, mut obstacle_src) = rdl_obstructions(&db, &layer, bloat);
-    // ⚠️ The via enclosures join the ATTRIBUTABLE group, before the prefix is measured — they carry
-    // a source terminal and must be excusable for it.
-    obstructions.extend(via_obstacles);
-    obstacle_src.extend(via_src);
-    let instance_obstructions = obstructions.len();
-    obstructions.extend(rdl_wire_obstructions(&db, &layer, bloat, &routing));
-    let clear = rdl::edges_clear(&g, allow45, &|a, b| rdl::blocked(a, b, &obstructions));
-    // ⛔ **The obstructions a terminal may be excused from are ITS OWN, by source object.**
-    // Upstream's filter is `std::get<3>(value) != target.terminal` — identity, not geometry. An
-    // earlier version excused whatever CONTAINED the target centre, which excuses a neighbour's
-    // pad when that pad covers this one, and the router then reaches a terminal the reference
-    // cannot: measured on `_overlapping_iterms`, `BUMP_1_16`'s metal covers `u_v18_25` and we
-    // routed to it where upstream has **0** wires touching it.
-    //
-    // ⚠️ Never the wire-derived ones either: those carry a null source upstream.
-    let access_own = |terminal: &str| -> Vec<rdl::Obstacle> {
-        obstructions[..instance_obstructions]
-            .iter()
-            .zip(obstacle_src.iter())
-            .filter(|(_, s)| s.as_deref() == Some(terminal))
-            .map(|(o, _)| o.clone())
-            .collect()
-    };
+    let mut blockers = rdl_obstructions(&db, &layer, bloat);
+    // ⚠️ The via enclosures join the EXCUSABLE group — they carry a source terminal and a bump must
+    // be able to reach through its own.
+    rdl_via_obstructions(
+        &db, &via_targets, bloat, bump_via.is_some(), pad_via.is_some(), &mut blockers,
+    );
+    // 🔑 Everything pushed so far may be excused for its own terminal; nothing after may. Wire- and
+    // block-derived obstructions carry upstream's `nullptr` source and are never excused.
+    blockers.seal_excusable();
+    rdl_wire_obstructions(&db, &layer, bloat, &routing, &mut blockers);
+    let clear = rdl::edges_clear(&g, allow45, &|a, b| blockers.blocked(a, b));
     let mut target_report = String::new();
     let mut total_targets = 0usize;
     for n in &nets {
@@ -1502,7 +1478,6 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let mut graph = rdl::Graph::build(&g, &clear, 1.0);
         // Graft both terminals onto the grid, as the reference does before each attempt.
         for centre in [(sx, sy), (tx, ty)] {
-            let own = access_own(""); // --probe has no terminal, so nothing is excused
             let t = rdl::Target {
                 terminal: String::new(),
                 centre,
@@ -1510,9 +1485,9 @@ fn rdl_route(args: &[String]) -> ExitCode {
                 access: Vec::new(),
                 layer: layer.clone(),
             };
-            let snaps = rdl::access_points(&g, &t, &obstructions, &own);
+            let snaps = rdl::access_points(&g, &t, &blockers);
             rdl::insert_access(&mut graph, &g, centre, &snaps, allow45, &|a, b| {
-                rdl::blocked(a, b, &obstructions)
+                blockers.blocked(a, b)
             });
         }
         // ⛔ **Cost the reference's path in OUR graph**, rather than assuming the two are a tie.
@@ -1723,7 +1698,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
          \"targets\": {},\n  \"columns\": {},\n  \"rows\": {}\n}}",
         g.vertices(),
         clear.len(),
-        obstructions.len(),
+        blockers.len(),
         nets.len(),
         total_targets,
         g.x.len(),
@@ -1769,8 +1744,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         for t in &targets {
             let (inst, pin) = t.terminal.rsplit_once('/').unwrap_or(("", ""));
             let (inst, pin) = (inst.to_string(), pin.to_string());
-            let own = access_own(&t.terminal);
-            let snaps = rdl::access_points(&g, t, &obstructions, &own);
+            let snaps = rdl::access_points(&g, t, &blockers);
             // ⛔ …and then the terminal's own DIAGONAL pin edges. An octagonal pad's access line
             // may leave the target centre and cross a facet of the very pin it is reaching, which
             // the reference removes; the axis-aligned edges are skipped explicitly.
@@ -1975,7 +1949,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             max_iters,
             opts.get("rebuild-each").map(|_| clear.as_slice()),
             allow45,
-            &|a, b| rdl::blocked(a, b, &obstructions),
+            &|a, b| blockers.blocked(a, b),
         );
 
     if !opts.dry_run {
