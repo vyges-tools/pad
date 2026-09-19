@@ -1521,7 +1521,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         };
         let turn = opts.get("turn-penalty").and_then(|v| v.parse().ok()).unwrap_or(2.0f32);
-        let mut graph = rdl::Graph::build(&g, &clear, 1.0);
+        let mut graph = rdl::Graph::build(&g, &clear);
         // Graft both terminals onto the grid, as the reference does before each attempt.
         for centre in [(sx, sy), (tx, ty)] {
             let t = rdl::Target {
@@ -1662,7 +1662,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     // own `Router_edge` level-1 "Adding edge from (x, y) to (x, y) with weight w" dump can be
     // sorted and diffed against it directly.
     if let Some(path) = opts.get("edge-report") {
-        let graph = rdl::Graph::build(&g, &clear, 1.0);
+        let graph = rdl::Graph::build(&g, &clear);
         let mut lines: Vec<String> = Vec::new();
         for (u, out) in graph.adj.iter().enumerate() {
             for &(v, w) in out {
@@ -1689,7 +1689,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     // ⚠️ Emitted in STORED order, never sorted. Sorting it would compare a different thing and
     // agree when the engine does not.
     if let Some(path) = opts.get("adj-report") {
-        let graph = rdl::Graph::build(&g, &clear, 1.0);
+        let graph = rdl::Graph::build(&g, &clear);
         let mut body = String::new();
         for (u, out) in graph.adj.iter().enumerate() {
             let p = graph.points[u];
@@ -1982,7 +1982,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         }
     }
 
-    let mut graph = rdl::Graph::build(&g, &clear, 1.0);
+    let mut graph = rdl::Graph::build(&g, &clear);
     let done =
         rdl::route_all(
             &mut graph,

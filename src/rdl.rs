@@ -118,36 +118,46 @@ pub fn distance(p0: Point, p1: Point) -> i64 {
 /// ⚠️ A **horizontal** edge costs one unit more than the same-length vertical one. It is not a
 /// physical cost: it is a tie-break, and it is what stops two equally short routes from being
 /// chosen arbitrarily. Dropping it does not make routes longer, it makes them unstable.
-pub fn edge_weight(p0: Point, p1: Point, scale: f32) -> i64 {
+pub fn edge_weight(p0: Point, p1: Point) -> i64 {
+    // ⛔ **No scale, and no float.** Upstream `addGraphEdge` now reads:
+    //
+    //     int64_t weight = 0;
+    //     if (config.weight.has_value()) { weight = config.weight.value(); }
+    //     else { const int64_t direction_bias = point0.y() == point1.y() ? 1 : 0;
+    //            weight = distance(point0, point1) + direction_bias; }
+    //
+    // `edge_weight_scale` is GONE (PR#11396 / `eb20ea09`): an edge is either an explicit weight
+    // or `distance + bias`. The scale parameter this used to take was only ever 1.0 in
+    // production — the one non-unit value came from `restore_scale`, which that PR removed the
+    // need for.
+    //
+    // ⚠️ **Dropping the float is fidelity, not tidiness.** The old expression went through `f32`,
+    // whose 24-bit mantissa is exact only to 16,777,216; upstream is `int64_t` throughout, so a
+    // die large enough for a distance past that would have diverged silently. Being NARROWER
+    // than the reference is a divergence in the same way being wider is.
     let bias = i64::from(p0.1 == p1.1);
-    // ⚠️ Upstream is `const int64_t weight = edge_weight_scale * distance(p0, p1) + direction_bias;`
-    // — a `float * int64_t + int64_t` expression evaluated wholly in float and truncated ONCE, at
-    // the assignment. Truncating the product first and adding the bias afterwards is a different
-    // number whenever the product lands just below an integer, which is exactly what a restored
-    // edge's recovered scale produces.
-    (scale * distance(p0, p1) as f32 + bias as f32) as i64
+    distance(p0, p1) + bias
 }
 
-/// **G5a** — the scale `removeGraphEdge` hands back, recovered by DIVISION.
-///
-/// ⛔ **Upstream does not store the scale; it divides the weight by the distance to get it back**:
-///
-/// ```text
-/// removeGraphEdge: const float weight = graph_weight_[edge];
-///                  return {p0, p1, weight / distance(p0, p1)};
-/// uncommitRoute:   addGraphEdge(p0, p1, weight, false, false);   // that quotient, as the SCALE
-/// removeTerminalAccess: addGraphEdge(pt0, pt1, weight, true, true);
-/// ```
-///
-/// 🔑 **The round trip does not return the original weight.** A horizontal edge is stored as
-/// `d + 1` (the `direction_bias`), so the recovered scale is `(d + 1) / d`, and re-adding gives
-/// `(d + 1) + 1 = d + 2`. **Every rip-up or terminal-access cycle makes a horizontal edge one unit
-/// dearer**; vertical and 45° edges carry no bias, recover a scale of exactly 1.0, and are
-/// unchanged. ⚠️ Measured in the reference's own `Router_edge` log for `rdl_route_45`: **548 edges
-/// restored at weight 25602** where a fresh one of that length is 25601.
-pub fn restore_scale(p0: Point, p1: Point, weight: i64) -> f32 {
-    weight as f32 / distance(p0, p1) as f32
-}
+// ⛔ **`restore_scale` is DELETED — the rip-up round trip is lossless now.**
+//
+// It existed to reproduce upstream's old `removeGraphEdge`, which did not hand back the weight
+// but a SCALE recovered by division:
+//
+//     const float weight = graph_weight_[edge];
+//     return {p0, p1, weight / distance(p0, p1)};      // a scale, not a weight
+//
+// A horizontal edge is stored as `d + 1`, so the recovered scale was `(d + 1) / d` and re-adding
+// gave `d + 2` — **every rip-up made a horizontal edge one unit dearer**. We reproduced that
+// faithfully, which is how we could measure it and report it: 548 edges restored at weight 25602
+// where a fresh one of that length is 25601, in the reference's own `Router_edge` log for
+// `rdl_route_45`. Filed as issue #11305, fixed upstream by PR#11396 (`eb20ea09`, *"pad: avoid
+// re-adding the bias to the graph edges"*), which now returns the weight itself:
+//
+//     const int64_t weight = graph_weight_[edge];
+//     return {p0, p1, weight};
+//
+// ⟹ An undone edge comes back at exactly the weight it left with. Carry the weight, not a scale.
 
 /// A rectangle, already bloated by the clearance the router must keep.
 pub type Rect = (i32, i32, i32, i32);
@@ -430,14 +440,14 @@ impl Graph {
     ///
     /// ⚠️ Every grid point becomes a vertex, including points with no edges at all. The reference
     /// does the same, and vertex numbering follows from it — x outer, y inner.
-    pub fn build(g: &Grid, edges: &[(Point, Point)], scale: f32) -> Graph {
+    pub fn build(g: &Grid, edges: &[(Point, Point)]) -> Graph {
         let points: Vec<Point> = g.points().collect();
         let index: std::collections::HashMap<Point, usize> =
             points.iter().enumerate().map(|(i, &p)| (p, i)).collect();
         let mut adj = vec![Vec::new(); points.len()];
         for &(a, b) in edges {
             let (Some(&ia), Some(&ib)) = (index.get(&a), index.get(&b)) else { continue };
-            let w = edge_weight(a, b, scale);
+            let w = edge_weight(a, b);
             adj[ia].push((ib, w));
             adj[ib].push((ia, w));
         }
@@ -481,8 +491,10 @@ impl Graph {
 /// Edges to put back when a temporary change is undone.
 #[derive(Debug, Clone, Default)]
 pub struct Undo {
-    /// `(a, b, scale)` — the scale `removeGraphEdge` recovers by division, not the weight.
-    pub restore: Vec<(usize, usize, f32)>,
+    /// `(a, b, weight)` — the weight the edge carried, handed back verbatim by
+    /// `removeGraphEdge` since PR#11396. It used to be a scale recovered by division; see the
+    /// note where `restore_scale` was deleted.
+    pub restore: Vec<(usize, usize, i64)>,
     pub cut: Vec<(usize, usize)>,
 }
 
@@ -492,9 +504,11 @@ impl Graph {
         for &(a, b) in &undo.cut {
             self.cut(a, b);
         }
-        for &(a, b, scale) in &undo.restore {
-            let w = edge_weight(self.points[a], self.points[b], scale);
-            self.join(a, b, w);
+        for &(a, b, weight) in &undo.restore {
+            // The stored weight goes back verbatim — upstream passes it as
+            // `AddEdgeConfig{.weight = weight}`, which `addGraphEdge` uses without
+            // re-deriving distance or re-applying the direction bias.
+            self.join(a, b, weight);
         }
     }
 
@@ -543,12 +557,12 @@ pub fn insert_access(
             .collect();
         if let [a, b] = ends[..] {
             if let Some(w) = graph.weight_between(a, b) {
-                undo.restore.push((a, b, restore_scale(graph.points[a], graph.points[b], w)));
+                undo.restore.push((a, b, w));
             }
             graph.cut(a, b);
         }
         let sv = graph.vertex(snap);
-        let w = edge_weight(snap, centre, 1.0);
+        let w = edge_weight(snap, centre);
         graph.join(sv, c, w);
         undo.cut.push((sv, c));
         for &e in &ends {
@@ -556,7 +570,7 @@ pub fn insert_access(
             if obstructed(snap, pt_e) {
                 continue;
             }
-            let w = edge_weight(snap, pt_e, 1.0);
+            let w = edge_weight(snap, pt_e);
             graph.join(sv, e, w);
             undo.cut.push((sv, e));
 
@@ -591,7 +605,7 @@ pub fn insert_access(
                 for o in doomed {
                     if let Some(w) = graph.weight_between(e, o) {
                         undo.restore
-                            .push((e, o, restore_scale(graph.points[e], graph.points[o], w)));
+                            .push((e, o, w));
                     }
                     graph.cut(e, o);
                 }
@@ -905,7 +919,7 @@ pub fn commit_route(
 
     for (a, b) in drop {
         if let Some(w) = graph.weight_between(a, b) {
-            undo.restore.push((a, b, restore_scale(graph.points[a], graph.points[b], w)));
+            undo.restore.push((a, b, w));
             graph.cut(a, b);
         }
     }
@@ -1504,13 +1518,12 @@ pub fn undo_access(graph: &mut Graph, undo: &Undo, blocked_edge: &dyn Fn(Point, 
     for &(a, b) in &undo.cut {
         graph.cut(a, b);
     }
-    for &(a, b, scale) in &undo.restore {
+    for &(a, b, weight) in &undo.restore {
         let (pa, pb) = (graph.points[a], graph.points[b]);
         if blocked_edge(pa, pb) {
             continue;
         }
-        let w = edge_weight(pa, pb, scale);
-        graph.join(a, b, w);
+        graph.join(a, b, weight);
     }
 }
 
@@ -1644,7 +1657,7 @@ pub fn route_all(
                 // runs differ, the accumulated order is what decides the remaining equal-cost
                 // choices.
                 if let Some(base) = rebuild {
-                    *graph = Graph::build(grid, base, 1.0);
+                    *graph = Graph::build(grid, base);
                     let laid_paths: Vec<Vec<Point>> =
                         routes.iter().filter(|r| r.routed).map(|r| r.points.clone()).collect();
                     for pts in &laid_paths {
@@ -2082,7 +2095,7 @@ mod tests {
     fn a_path_is_found_across_a_small_grid() {
         let coords: Vec<i32> = (0..5).map(|i| 10 + i * 100).collect();
         let g = grid(&coords, &coords, 4, 4);
-        let graph = Graph::build(&g, &edges(&g, false), 1.0);
+        let graph = Graph::build(&g, &edges(&g, false));
         let path = shortest_path(&graph, (10, 10), (410, 410), 2.0);
         assert!(!path.is_empty(), "a clear grid must be crossable");
         assert_eq!(path.first(), Some(&(10, 10)));
@@ -2098,7 +2111,7 @@ mod tests {
         // A wall across the middle column, open at the top.
         let wall = [Obstacle::Rect((150, 0, 170, 350))];
         let e = edges_clear(&g, false, &|a, b| blocked(a, b, &wall));
-        let graph = Graph::build(&g, &e, 1.0);
+        let graph = Graph::build(&g, &e);
         let path = shortest_path(&graph, (10, 10), (410, 10), 2.0);
         assert!(!path.is_empty(), "must go around");
         assert!(path.iter().any(|p| p.1 >= 310), "detoured over the wall");
@@ -2110,7 +2123,7 @@ mod tests {
         let g = grid(&coords, &coords, 4, 4);
         let wall = [Obstacle::Rect((150, -100, 170, 1000))];
         let e = edges_clear(&g, false, &|a, b| blocked(a, b, &wall));
-        let graph = Graph::build(&g, &e, 1.0);
+        let graph = Graph::build(&g, &e);
         assert!(shortest_path(&graph, (10, 10), (410, 10), 2.0).is_empty());
     }
 
@@ -2180,7 +2193,7 @@ mod tests {
     fn an_acute_diagonal_out_of_an_access_point_is_pruned() {
         // A 5x5 grid at 100 pitch; diagonals exist only where both indices are even.
         let g = Grid { x: vec![0, 100, 200, 300, 400], y: vec![0, 100, 200, 300, 400] };
-        let build = || Graph::build(&g, &edges(&g, true), 1.0);
+        let build = || Graph::build(&g, &edges(&g, true));
 
         // ⚠️ The snap must sit BETWEEN two columns so its neighbours are x-neighbours, and one
         // of them must be at an even/even index or it has no diagonals to prune at all. (200,200)
@@ -2303,13 +2316,27 @@ mod tests {
     #[test]
     fn a_horizontal_edge_costs_one_more_than_the_same_vertical_one() {
         // ⚠️ The tie-break that makes route choice stable.
-        assert_eq!(edge_weight((0, 0), (100, 0), 1.0), 101);
-        assert_eq!(edge_weight((0, 0), (0, 100), 1.0), 100);
+        assert_eq!(edge_weight((0, 0), (100, 0)), 101);
+        assert_eq!(edge_weight((0, 0), (0, 100)), 100);
     }
 
     #[test]
-    fn the_weight_scale_multiplies_the_distance_but_not_the_bias() {
-        assert_eq!(edge_weight((0, 0), (100, 0), 2.0), 201);
+    fn an_edge_weight_is_pure_integer_arithmetic_with_no_scale() {
+        // ⛔ Replaces `the_weight_scale_multiplies_the_distance_but_not_the_bias`, which pinned a
+        // concept upstream DELETED in PR#11396: `addGraphEdge` no longer takes an
+        // `edge_weight_scale`, only an optional explicit weight, defaulting to
+        // `distance + direction_bias`.
+        //
+        // ⚠️ The old path multiplied in `f32`. This distance is past the 24-bit mantissa's exact
+        // range (16,777,216), so the float form would round; the integer form cannot.
+        let far = 20_000_000;
+        assert_eq!(edge_weight((0, 0), (far, 0)), far as i64 + 1, "horizontal: distance + bias");
+        assert_eq!(edge_weight((0, 0), (0, far)), far as i64, "vertical: no bias");
+        assert_ne!(
+            edge_weight((0, 0), (far, 0)) as f32 as i64,
+            edge_weight((0, 0), (far, 0)),
+            "and f32 genuinely cannot hold it — which is why the float path had to go"
+        );
     }
 }
 
@@ -2332,7 +2359,7 @@ mod oct_commit_tests {
         let grid = Grid { x: vec![40, 60, 140, 160], y: vec![40, 60] };
         let probe1 = ((40, 60), (60, 40));
         let probe2 = ((140, 60), (160, 40));
-        let mut graph = Graph::build(&grid, &[probe1, probe2], 1.0);
+        let mut graph = Graph::build(&grid, &[probe1, probe2]);
         let (a1, b1) = (graph.index[&probe1.0], graph.index[&probe1.1]);
         let (a2, b2) = (graph.index[&probe2.0], graph.index[&probe2.1]);
         assert!(graph.weight_between(a1, b1).is_some() && graph.weight_between(a2, b2).is_some());
@@ -2356,7 +2383,7 @@ mod oct_commit_tests {
     fn an_axis_aligned_segment_contributes_no_octagon() {
         let grid = Grid { x: vec![150, 160], y: vec![95, 105] };
         let probe = ((150, 95), (160, 105));
-        let mut graph = Graph::build(&grid, &[probe], 1.0);
+        let mut graph = Graph::build(&grid, &[probe]);
         let (a, b) = (graph.index[&probe.0], graph.index[&probe.1]);
         commit_route(&mut graph, &[(0, 0), (100, 100), (200, 100)], 20, 0, true);
         assert!(
@@ -2373,7 +2400,7 @@ mod oct_commit_tests {
     fn the_octagon_is_built_at_the_corridor_distance() {
         let grid = Grid { x: vec![160, 165], y: vec![50, 55] };
         let probe = ((160, 55), (165, 50));
-        let mut graph = Graph::build(&grid, &[probe], 1.0);
+        let mut graph = Graph::build(&grid, &[probe]);
         let (a, b) = (graph.index[&probe.0], graph.index[&probe.1]);
         commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, true);
         assert!(
@@ -2388,7 +2415,7 @@ mod oct_commit_tests {
     fn the_octagon_is_no_wider_than_the_corridor_distance() {
         let grid = Grid { x: vec![170, 175], y: vec![60, 65] };
         let probe = ((170, 65), (175, 60));
-        let mut graph = Graph::build(&grid, &[probe], 1.0);
+        let mut graph = Graph::build(&grid, &[probe]);
         let (a, b) = (graph.index[&probe.0], graph.index[&probe.1]);
         commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, true);
         assert!(graph.weight_between(a, b).is_some(), "x + y = 235 is clear of the octagon");
@@ -2400,7 +2427,7 @@ mod oct_commit_tests {
     fn without_allow45_no_octagon_is_applied_at_all() {
         let grid = Grid { x: vec![40, 60, 140, 160], y: vec![40, 60] };
         let (probe1, probe2) = (((40, 60), (60, 40)), ((140, 60), (160, 40)));
-        let mut graph = Graph::build(&grid, &[probe1, probe2], 1.0);
+        let mut graph = Graph::build(&grid, &[probe1, probe2]);
         let (a2, b2) = (graph.index[&probe2.0], graph.index[&probe2.1]);
         commit_route(&mut graph, &[(0, 0), (100, 100), (200, 0)], 20, 0, false);
         assert!(graph.weight_between(a2, b2).is_some());
@@ -2651,7 +2678,7 @@ mod write_order_tests {
         let mut undo = Undo::default();
         for (u, v) in [(a, b), (c, d)] {
             let w = g.weight_between(u, v).unwrap();
-            undo.restore.push((u, v, restore_scale(g.points[u], g.points[v], w)));
+            undo.restore.push((u, v, w));
             g.cut(u, v);
         }
         assert_eq!(g.weight_between(a, b), None);
@@ -2662,13 +2689,17 @@ mod write_order_tests {
         undo_access(&mut g, &undo, &blocked);
 
         assert_eq!(g.weight_between(a, b), None, "the crossed edge stays out");
-        // ⚠️ **101, not 100** — and that is the other rule, not a slip. c–d is HORIZONTAL, so it
-        // was stored with the `direction_bias`; the scale `removeGraphEdge` recovers by division
-        // carries that bias, and re-adding applies it a second time. See `restore_scale`.
+        // 🔑 **100, and the round trip is now LOSSLESS.** This asserted 101 until pin
+        // `da9f29f1`: c–d is horizontal, so it was stored as `d + 1`, and the old
+        // `removeGraphEdge` handed back `weight / distance` — a SCALE still carrying the bias —
+        // so re-adding applied the bias a second time and every rip-up made a horizontal edge
+        // one unit dearer. We reproduced that faithfully and reported it as issue #11305;
+        // upstream PR#11396 (`eb20ea09`) now returns the weight itself, so an edge comes back
+        // at exactly the weight it left with.
         assert_eq!(
             g.weight_between(c, d),
-            Some(101),
-            "the clear one comes back, one unit dearer for being horizontal"
+            Some(100),
+            "the clear one comes back at the weight it left with, not one unit dearer"
         );
     }
 
@@ -2724,7 +2755,7 @@ mod write_order_tests {
         // One corridor. Whichever route commits first takes the middle out from under the other.
         let grid = Grid { x: vec![0, 10, 20, 30], y: vec![0] };
         let edges = vec![((0, 0), (10, 0)), ((10, 0), (20, 0)), ((20, 0), (30, 0))];
-        let mut graph = Graph::build(&grid, &edges, 1.0);
+        let mut graph = Graph::build(&grid, &edges);
 
         let mut routes = vec![
             route("A/p", (0, 0), dest("B/p", (30, 0), 2), 1),
@@ -2753,7 +2784,7 @@ mod write_order_tests {
         // A reachable corridor 0..30, plus an isolated vertex at 100 that nothing can reach.
         let grid = Grid { x: vec![0, 10, 20, 30, 100], y: vec![0] };
         let edges = vec![((0, 0), (10, 0)), ((10, 0), (20, 0)), ((20, 0), (30, 0))];
-        let mut graph = Graph::build(&grid, &edges, 1.0);
+        let mut graph = Graph::build(&grid, &edges);
 
         let mut r = route("A/p", (0, 0), dest("X/p", (100, 0), 2), 1);
         r.dests.push(dest("B/p", (30, 0), 4)); // tried only after X/p fails
@@ -2789,7 +2820,7 @@ mod write_order_tests {
             ((10, 1000), (20, 1000)),
             ((20, 1000), (30, 1000)),
         ];
-        let mut graph = Graph::build(&grid, &edges, 1.0);
+        let mut graph = Graph::build(&grid, &edges);
 
         let mut routes = vec![
             route("A/p", (0, 0), dest("B/p", (30, 0), 2), 1),
