@@ -1309,6 +1309,26 @@ impl Route {
     }
 }
 
+/// **Q1** — take the route the queue would serve next, `std::priority_queue::top()` then `pop()`.
+///
+/// ⛔ **A route that fails an attempt goes back IN BY ITS KEY, not to the back of the line.** The
+/// router's loop ends with `if (!segment->isRouted() && segment->hasNextTerminal())
+/// route_queue.push(segment)`, and that queue is a heap over `RDLSegment::compare` — so the
+/// re-queued route, now keyed on its NEXT destination, competes with everything still waiting.
+/// Sorting once per iteration and appending re-queued routes serves them in the order they
+/// FAILED instead, which reordered nine bump-to-bump segments on
+/// `rdl_route_assignments_overlapping_iterms` (each first tries a pad with no target pairs).
+///
+/// ℹ️ Taking the minimum each time IS the heap's order here: the key is a strict total order
+/// (distance ties fall to the unique terminal id), and a queued route's key cannot change while it
+/// waits — `next_` only moves when the route itself is popped, and priorities change only at the
+/// end of an iteration, when the queue is empty. Of equal keys (only routes with nothing left to
+/// try) the FIRST queued is taken.
+pub fn pop_top(queue: &mut Vec<usize>, routes: &[Route]) -> Option<usize> {
+    let k = (0..queue.len()).min_by(|&x, &y| routes[queue[x]].precedes(&routes[queue[y]]))?;
+    Some(queue.remove(k))
+}
+
 /// **L1** — a route has failed when it is off the queue, unrouted, and out of destinations.
 ///
 /// ⚠️ All three. A route still on the queue has not failed, it has not been tried; and one with
@@ -1581,9 +1601,7 @@ pub fn route_all(
     let mut last_done: std::collections::BTreeSet<String> = Default::default();
 
     loop {
-        queue.sort_by(|&a, &b| routes[a].precedes(&routes[b]));
-        while let Some(i) = queue.first().copied() {
-            queue.remove(0);
+        while let Some(i) = pop_top(&mut queue, routes) {
             routes[i].pending = false;
             if !routes[i].has_next() {
                 continue;
@@ -2030,6 +2048,22 @@ mod tests {
         let mut bumped = far.clone();
         bumped.priority = 1;
         assert_eq!(bumped.precedes(&near), std::cmp::Ordering::Less, "priority wins");
+    }
+
+    /// The reference re-pushes a route that failed an attempt into its priority queue, so it is
+    /// served by its new key — not after everything that was already waiting.
+    #[test]
+    fn a_requeued_route_competes_by_its_key_not_by_when_it_failed() {
+        let routes = vec![
+            route((0, 0), 1, vec![dest("a", "A", (320, 0), false, 11)]), // waiting, far
+            route((0, 0), 2, vec![dest("b", "B", (160, 0), false, 12)]), // re-queued, near
+            route((0, 0), 3, vec![dest("c", "C", (160, 0), false, 13)]), // re-queued, near, higher id
+        ];
+        // Queued in the order they arrived: the far one first, the two re-queued ones behind it.
+        let mut queue = vec![0, 1, 2];
+        let order: Vec<usize> = std::iter::from_fn(|| pop_top(&mut queue, &routes)).collect();
+        // Nearest first; of equal distance the HIGHER terminal id (the heap's top); the far one last.
+        assert_eq!(order, vec![2, 1, 0]);
     }
 
     #[test]
