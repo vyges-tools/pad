@@ -35,6 +35,25 @@ use vyges_pad::abut::{connect_by_abutment, special_sig_type, touching_terms, Pad
 use vyges_pad::bond::{bond_shape, is_bond_master, matching, pin_shape, place as bond_place};
 use vyges_pad::assign::{assign, BumpTerm, Refused as AssignRefused};
 
+/// A diagnostic as a structured event (`PAD-ERROR`, `vyges-events/1.0`) instead of a bare stderr
+/// line; text after a blank line (the usage) stays plain help.
+fn diag_line(msg: String) {
+    let (head, help) = match msg.split_once("\n\n") {
+        Some((h, rest)) => (h.to_string(), Some(rest.to_string())),
+        None => (msg, None),
+    };
+    let text = head.strip_prefix("vyges-pad: ").unwrap_or(&head).to_string();
+    vyges_events::emit(&vyges_events::Event::new("vyges-pad", vyges_events::Severity::Error, text).with_code("PAD-ERROR"));
+    if let Some(h) = help {
+        eprintln!("{h}");
+    }
+}
+
+macro_rules! diag {
+    ($($t:tt)*) => { diag_line(format!($($t)*)) };
+}
+
+
 // ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
 // registry is what actually decides it (`group: "physical"`). It read `vyges loom pad`
 // for a release after the construction engines were split out of the loom suite, because
@@ -457,7 +476,7 @@ fn place_corners(args: &[String]) -> ExitCode {
     let master = match opts.need("master").map(str::to_string) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("vyges-pad: {e}\n\n{USAGE}");
+            diag!("vyges-pad: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -466,7 +485,7 @@ fn place_corners(args: &[String]) -> ExitCode {
         Some(v) => match v.parse() {
             Ok(n) => n,
             Err(_) => {
-                eprintln!("vyges-pad: --ring-index wants a whole number");
+                diag!("vyges-pad: --ring-index wants a whole number");
                 return ExitCode::from(2);
             }
         },
@@ -474,7 +493,7 @@ fn place_corners(args: &[String]) -> ExitCode {
     let size = match master_size(&db, &master) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -483,7 +502,7 @@ fn place_corners(args: &[String]) -> ExitCode {
     let mut skipped = Vec::new();
     for row_name in corner_row_names(ring_index) {
         let Some(row) = read_row(&db, &row_name) else {
-            eprintln!("vyges-pad: no row `{row_name}` to place a corner in");
+            diag!("vyges-pad: no row `{row_name}` to place a corner in");
             return ExitCode::from(2);
         };
         let p = corner_placement(&row, &master);
@@ -505,7 +524,7 @@ fn place_corners(args: &[String]) -> ExitCode {
         }
         if !opts.dry_run {
             if let Err(e) = commit(&mut db, &p, true) {
-                eprintln!("vyges-pad: {e}");
+                diag!("vyges-pad: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -552,7 +571,7 @@ fn make_fake_io_site(args: &[String]) -> ExitCode {
     let made = match built {
         Ok(v) => vec![v],
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -607,14 +626,14 @@ fn place_pad(args: &[String]) -> ExitCode {
     let (p, size, create) = match built {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
     let _ = size;
     if !opts.dry_run {
         if let Err(e) = commit(&mut db, &p, create) {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     }
@@ -626,19 +645,19 @@ fn open(args: &[String]) -> Result<(Opts, Db), ExitCode> {
     let opts = match parse_opts(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("vyges-pad: {e}\n\n{USAGE}");
+            diag!("vyges-pad: {e}\n\n{USAGE}");
             return Err(ExitCode::from(2));
         }
     };
     let db = match Db::open(&opts.odb) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("vyges-pad: cannot read {}: {e}", opts.odb);
+            diag!("vyges-pad: cannot read {}: {e}", opts.odb);
             return Err(ExitCode::from(2));
         }
     };
     if db.dbu_per_micron() <= 0 {
-        eprintln!("vyges-pad: no DBU scale");
+        diag!("vyges-pad: no DBU scale");
         return Err(ExitCode::from(2));
     }
     Ok((opts, db))
@@ -655,12 +674,12 @@ fn finish(
     if !opts.dry_run {
         let out_odb = opts.get("out-odb").unwrap_or(&opts.odb).to_string();
         if let Err(e) = db.write(&out_odb) {
-            eprintln!("vyges-pad: cannot write {out_odb}: {e}");
+            diag!("vyges-pad: cannot write {out_odb}: {e}");
             return ExitCode::from(2);
         }
         if let Some(path) = opts.get("out-def") {
             if let Err(e) = db.write_def(path) {
-                eprintln!("vyges-pad: cannot write {path}: {e}");
+                diag!("vyges-pad: cannot write {path}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -670,7 +689,7 @@ fn finish(
     match opts.get("o") {
         Some(path) => {
             if let Err(e) = std::fs::write(path, format!("{report}\n")) {
-                eprintln!("vyges-pad: cannot write {path}: {e}");
+                diag!("vyges-pad: cannot write {path}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -707,12 +726,12 @@ fn finish_report(
     if !opts.dry_run {
         let out_odb = opts.get("out-odb").unwrap_or(&opts.odb).to_string();
         if let Err(e) = db.write(&out_odb) {
-            eprintln!("vyges-pad: cannot write {out_odb}: {e}");
+            diag!("vyges-pad: cannot write {out_odb}: {e}");
             return ExitCode::from(2);
         }
         if let Some(path) = opts.get("out-def") {
             if let Err(e) = db.write_def(path) {
-                eprintln!("vyges-pad: cannot write {path}: {e}");
+                diag!("vyges-pad: cannot write {path}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -731,7 +750,7 @@ fn finish_report(
     match opts.get("o") {
         Some(path) => {
             if let Err(e) = std::fs::write(path, format!("{report}\n")) {
-                eprintln!("vyges-pad: cannot write {path}: {e}");
+                diag!("vyges-pad: cannot write {path}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -741,7 +760,7 @@ fn finish_report(
     // not wrong -- so this does not take the empty-result exit code the placement path uses.
     match failure {
         Some(why) => {
-            eprintln!("vyges-pad: {why}");
+            diag!("vyges-pad: {why}");
             ExitCode::from(1)
         }
         None => ExitCode::SUCCESS,
@@ -1338,7 +1357,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     let bump_via = resolve("bump-via");
     let pad_via = resolve("pad-via");
     if let Some(e) = via_err {
-        eprintln!("vyges-pad: {e}");
+        diag!("vyges-pad: {e}");
         return ExitCode::from(2);
     }
     let access_vias = (&bump_via, &pad_via);
@@ -1507,7 +1526,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             .collect();
         eprintln!("routes: {}  ordering ties hit: {ties}", routes.len());
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
         return ExitCode::SUCCESS;
@@ -1517,7 +1536,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     if let Some(spec) = opts.get("probe") {
         let n: Vec<i32> = spec.split_whitespace().filter_map(|t| t.parse().ok()).collect();
         let [sx, sy, tx, ty] = n[..] else {
-            eprintln!("vyges-pad: --probe wants `sx sy tx ty`");
+            diag!("vyges-pad: --probe wants `sx sy tx ty`");
             return ExitCode::from(2);
         };
         let turn = opts.get("turn-penalty").and_then(|v| v.parse().ok()).unwrap_or(2.0f32);
@@ -1652,7 +1671,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             body.push_str(&format!("y {y}\n"));
         }
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -1675,7 +1694,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         }
         lines.sort();
         if let Err(e) = std::fs::write(path, lines.join("\n") + "\n") {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -1701,7 +1720,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             body.push('\n');
         }
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -1713,7 +1732,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             }
         }
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -1727,13 +1746,13 @@ fn rdl_route(args: &[String]) -> ExitCode {
         let body: String =
             all.iter().map(|(x, y)| format!("{x} {y}\n")).collect();
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
     if let Some(path) = opts.get("target-report") {
         if let Err(e) = std::fs::write(path, &target_report) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -1753,7 +1772,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     match opts.get("o") {
         Some(path) => {
             if let Err(e) = std::fs::write(path, format!("{report}\n")) {
-                eprintln!("vyges-pad: cannot write {path}: {e}");
+                diag!("vyges-pad: cannot write {path}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -1977,7 +1996,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             }
         }
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -2092,7 +2111,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             Ok(())
         })();
         if let Err(e) = applied {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     }
@@ -2106,7 +2125,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
             })
             .collect();
         if let Err(e) = std::fs::write(path, body) {
-            eprintln!("vyges-pad: cannot write {path}: {e}");
+            diag!("vyges-pad: cannot write {path}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -2133,7 +2152,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
         .collect();
     let failure = (!failed_nets.is_empty()).then(|| {
         for n in &failed_nets {
-            eprintln!("vyges-pad: could not route {n}");
+            diag!("vyges-pad: could not route {n}");
         }
         format!("failed to route {} nets", failed_nets.len())
     });
@@ -2190,7 +2209,7 @@ fn assign_io_bump(args: &[String]) -> ExitCode {
     let (bump, net, terms, master_box, terminal) = match prepared {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -2209,7 +2228,7 @@ fn assign_io_bump(args: &[String]) -> ExitCode {
     // the same hole across its own `write_db`, which is why this is declared in the descriptor
     // rather than refused: refusing it would fail cases where the database effect really is nil.
     if opts.get("dont-route").is_some() && terminal.is_some() {
-        eprintln!("vyges-pad: --dont-route and --terminal cannot be used together");
+        diag!("vyges-pad: --dont-route and --terminal cannot be used together");
         return ExitCode::from(2);
     }
 
@@ -2227,7 +2246,7 @@ fn assign_io_bump(args: &[String]) -> ExitCode {
     ) {
         Ok(v) => v,
         Err(AssignRefused::WrongNet { terminal, net: other }) => {
-            eprintln!("vyges-pad: {terminal} is connected to {other}, not to {net}");
+            diag!("vyges-pad: {terminal} is connected to {other}, not to {net}");
             return ExitCode::from(2);
         }
     };
@@ -2250,7 +2269,7 @@ fn assign_io_bump(args: &[String]) -> ExitCode {
             Ok(())
         })();
         if let Err(e) = applied {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     }
@@ -2273,7 +2292,7 @@ fn place_io_terminals(args: &[String]) -> ExitCode {
     let patterns: Vec<String> = match opts.need("pins") {
         Ok(v) => v.split_whitespace().map(str::to_string).collect(),
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -2294,7 +2313,7 @@ fn place_io_terminals(args: &[String]) -> ExitCode {
     }
     let chosen: Vec<String> = matching(&named, &patterns).into_iter().cloned().collect();
     if chosen.is_empty() {
-        eprintln!("vyges-pad: no terminals matched {}", patterns.join(" "));
+        diag!("vyges-pad: no terminals matched {}", patterns.join(" "));
         return ExitCode::from(2);
     }
 
@@ -2324,11 +2343,11 @@ fn place_io_terminals(args: &[String]) -> ExitCode {
             })
             .collect();
         let Some((layer, rect)) = bond_shape(&pins) else {
-            eprintln!("vyges-pad: {inst}/{term} has no shape to make a terminal from");
+            diag!("vyges-pad: {inst}/{term} has no shape to make a terminal from");
             return ExitCode::from(2);
         };
         if !allow_lower && layer != top_layer {
-            eprintln!(
+            diag!(
                 "vyges-pad: {inst}/{term} has no shape on {top_layer}, only on {layer}"
             );
             return ExitCode::from(2);
@@ -2338,7 +2357,7 @@ fn place_io_terminals(args: &[String]) -> ExitCode {
         let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
         if !opts.dry_run {
             if let Err(e) = make_bterm(&mut db, &net, &layer, pin_shape(rect, orient, origin)) {
-                eprintln!("vyges-pad: {e}");
+                diag!("vyges-pad: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -2388,7 +2407,7 @@ fn place_io_fill(args: &[String]) -> ExitCode {
     let (track, fillers) = match setup {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -2422,14 +2441,14 @@ fn place_io_fill(args: &[String]) -> ExitCode {
     let planned = match planned {
         Ok(v) => v,
         Err(Unfilled::Ragged { span }) => {
-            eprintln!(
+            diag!(
                 "vyges-pad: filling {} from {} to {} would leave a gap",
                 track.row.name, span.0, span.1
             );
             return ExitCode::from(2);
         }
         Err(Unfilled::Short { span }) => {
-            eprintln!(
+            diag!(
                 "vyges-pad: cannot fill {} from {} to {} with the given cells",
                 track.row.name, span.0, span.1
             );
@@ -2442,7 +2461,7 @@ fn place_io_fill(args: &[String]) -> ExitCode {
         let (w, h) = match master_size(&db, &cell.master) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("vyges-pad: {e}");
+                diag!("vyges-pad: {e}");
                 return ExitCode::from(2);
             }
         };
@@ -2451,7 +2470,7 @@ fn place_io_fill(args: &[String]) -> ExitCode {
         let p = Placement { name: cell.name.clone(), master: cell.master.clone(), x, y, orient };
         if !opts.dry_run {
             if let Err(e) = commit(&mut db, &p, true) {
-                eprintln!("vyges-pad: {e}");
+                diag!("vyges-pad: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -2508,7 +2527,7 @@ fn place_bondpad(args: &[String]) -> ExitCode {
     let (bond, layer, bond_rect, offset, rotation, prefix) = match setup {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -2516,14 +2535,14 @@ fn place_bondpad(args: &[String]) -> ExitCode {
     let patterns: Vec<String> = match opts.need("insts") {
         Ok(v) => v.split_whitespace().map(str::to_string).collect(),
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
     let all = db.inst_names();
     let chosen: Vec<String> = matching(&all, &patterns).into_iter().cloned().collect();
     if chosen.is_empty() {
-        eprintln!("vyges-pad: no instances matched {}", patterns.join(" "));
+        diag!("vyges-pad: no instances matched {}", patterns.join(" "));
         return ExitCode::from(2);
     }
 
@@ -2551,7 +2570,7 @@ fn place_bondpad(args: &[String]) -> ExitCode {
                     .map_err(|e| format!("{}: {e}", b.name))
             })();
             if let Err(e) = made {
-                eprintln!("vyges-pad: cannot create {e}");
+                diag!("vyges-pad: cannot create {e}");
                 return ExitCode::from(2);
             }
             for (term, net) in touching_nets(&db, pad, &b.name) {
@@ -2582,7 +2601,7 @@ fn place_bondpad(args: &[String]) -> ExitCode {
             Ok(())
         })();
         if let Err(e) = joined {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     }
@@ -2636,7 +2655,7 @@ fn connect_ring(args: &[String]) -> ExitCode {
     let plan = match connect_by_abutment(&insts, &|n| db.net_get_i_term_count(n) + db.net_get_b_term_count(n)) {
         Ok(p) => p,
         Err(c) => {
-            eprintln!(
+            diag!(
                 "vyges-pad: {}/{} ({}) and {}/{} ({}) are touching but on different nets",
                 insts[c.a.0].name,
                 insts[c.a.0].terms[c.a.1].name,
@@ -2668,7 +2687,7 @@ fn connect_ring(args: &[String]) -> ExitCode {
             Ok(())
         })();
         if let Err(e) = apply {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     }
@@ -2706,7 +2725,7 @@ fn refuse_unimplemented(opts: &Opts, unimplemented: &[(&str, &str)]) -> Option<E
 }
 
 fn unsupported_or_error(message: &str) -> ExitCode {
-    eprintln!("vyges-pad: {message}");
+    diag!("vyges-pad: {message}");
     ExitCode::from(if message.starts_with(UNSUPPORTED) { 3 } else { 2 })
 }
 
@@ -3030,7 +3049,7 @@ fn place_pads(args: &[String]) -> ExitCode {
             ("uniform", _) | ("default", false) => None,
             ("linear", _) => Some(0),
             ("bump_aligned", false) => {
-                eprintln!("vyges-pad: no pad connects to a bump, placing uniformly instead");
+                diag!("vyges-pad: no pad connects to a bump, placing uniformly instead");
                 None
             }
             ("default" | "bump_aligned", true) => Some(i32::MIN), // marker: bump-aligned
@@ -3127,7 +3146,7 @@ fn place_pads(args: &[String]) -> ExitCode {
         Err(Refused::OutOfRow { name, at }) => {
             write_intermediate(&mut db, &track, &intermediate);
             let _ = finish(&opts, &mut db, "pads", &[], &[]);
-            eprintln!("vyges-pad: {name} at {at:?} does not fit inside {}", track.row.name);
+            diag!("vyges-pad: {name} at {at:?} does not fit inside {}", track.row.name);
             return ExitCode::from(2);
         }
         Err(Refused::Blocked { name, at, why }) => {
@@ -3137,7 +3156,7 @@ fn place_pads(args: &[String]) -> ExitCode {
             // untouched, which is a different — and less useful — answer.
             write_intermediate(&mut db, &track, &intermediate);
             let _ = finish(&opts, &mut db, "pads", &[], &[]);
-            eprintln!(
+            diag!(
                 "vyges-pad: cannot place {name} at {at:?}: {:?} overlapping {:?}",
                 why.reason, why.overlap
             );
@@ -3148,7 +3167,7 @@ fn place_pads(args: &[String]) -> ExitCode {
     if !opts.dry_run {
         for p in &placed {
             if let Err(e) = commit(&mut db, p, false) {
-                eprintln!("vyges-pad: {e}");
+                diag!("vyges-pad: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -3240,14 +3259,14 @@ fn make_io_bump_array(args: &[String]) -> ExitCode {
     let placed = match built {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
     if !opts.dry_run {
         for p in &placed {
             if let Err(e) = commit(&mut db, p, true) {
-                eprintln!("vyges-pad: {e}");
+                diag!("vyges-pad: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -3294,14 +3313,14 @@ fn remove_io_bump(args: &[String], whole_array: bool) -> ExitCode {
     let chosen = match chosen {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
     if !opts.dry_run {
         for inst in &chosen {
             if let Err(e) = db.destroy_inst(inst) {
-                eprintln!("vyges-pad: cannot remove {inst}: {e}");
+                diag!("vyges-pad: cannot remove {inst}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -3314,7 +3333,7 @@ fn make_io_sites(args: &[String]) -> ExitCode {
     let opts = match parse_opts(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("vyges-pad: {e}\n\n{USAGE}");
+            diag!("vyges-pad: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -3322,13 +3341,13 @@ fn make_io_sites(args: &[String]) -> ExitCode {
     let mut db = match Db::open(&opts.odb) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("vyges-pad: cannot read {}: {e}", opts.odb);
+            diag!("vyges-pad: cannot read {}: {e}", opts.odb);
             return ExitCode::from(2);
         }
     };
     let dbu = db.dbu_per_micron();
     if dbu <= 0 {
-        eprintln!("vyges-pad: no DBU scale");
+        diag!("vyges-pad: no DBU scale");
         return ExitCode::from(2);
     }
 
@@ -3380,7 +3399,7 @@ fn make_io_sites(args: &[String]) -> ExitCode {
     let rows = match built {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("vyges-pad: {e}");
+            diag!("vyges-pad: {e}");
             return ExitCode::from(2);
         }
     };
@@ -3400,18 +3419,18 @@ fn make_io_sites(args: &[String]) -> ExitCode {
                 r.sites,
                 r.pitch,
             ) {
-                eprintln!("vyges-pad: cannot create row {}: {e}", r.name);
+                diag!("vyges-pad: cannot create row {}: {e}", r.name);
                 return ExitCode::from(2);
             }
         }
         let out_odb = opts.get("out-odb").unwrap_or(&opts.odb);
         if let Err(e) = db.write(out_odb) {
-            eprintln!("vyges-pad: cannot write {out_odb}: {e}");
+            diag!("vyges-pad: cannot write {out_odb}: {e}");
             return ExitCode::from(2);
         }
         if let Some(p) = opts.get("out-def") {
             if let Err(e) = db.write_def(p) {
-                eprintln!("vyges-pad: cannot write {p}: {e}");
+                diag!("vyges-pad: cannot write {p}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -3422,7 +3441,7 @@ fn make_io_sites(args: &[String]) -> ExitCode {
     match opts.get("o") {
         Some(path) => {
             if let Err(e) = std::fs::write(path, format!("{report}\n")) {
-                eprintln!("vyges-pad: cannot write {path}: {e}");
+                diag!("vyges-pad: cannot write {path}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -3529,7 +3548,7 @@ fn main() -> ExitCode {
         Some("remove-io-bump") => remove_io_bump(&args[1..], false),
         Some("remove-io-bump-array") => remove_io_bump(&args[1..], true),
         Some(other) => {
-            eprintln!("vyges-pad: unknown command `{other}`\n\n{USAGE}");
+            diag!("vyges-pad: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
