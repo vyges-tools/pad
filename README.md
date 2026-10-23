@@ -27,7 +27,7 @@ orientation composition is pinned by a case that the opposite reading gets wrong
 
 ## Scope
 
-The upstream module also contains a redistribution-layer **router**. That is a routing engine, and
+The reference module also contains a redistribution-layer **router**. That is a routing engine, and
 it is deliberately not part of this one.
 
 ## Building
