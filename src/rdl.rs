@@ -1623,6 +1623,7 @@ pub fn route_all(
     // so such a segment is never attempted — and never reported failed either.
     let mut queue: Vec<usize> = (0..routes.len()).filter(|&i| !routes[i].routed).collect();
     let mut last_done: std::collections::BTreeSet<String> = Default::default();
+    let mut last_terms: std::collections::BTreeSet<String> = Default::default();
 
     loop {
         while let Some(i) = pop_top(&mut queue, routes) {
@@ -1776,6 +1777,13 @@ pub fn route_all(
         out.progress.push((out.iterations, routed_terms.len(), total_terms));
         let done: std::collections::BTreeSet<String> =
             routes.iter().filter(|r| r.routed).map(|r| r.source.clone()).collect();
+        // `VYGES_PAD_TRACE`: both stop predicates — the routed SOURCES unchanged (this loop's) and
+        // the routed TERMINALS unchanged (the reference's `last_itr_routed == routed_terms`).
+        let terms: std::collections::BTreeSet<String> = routed_terms.iter().map(|t| t.to_string()).collect();
+        if std::env::var("VYGES_PAD_TRACE").is_ok() {
+            eprintln!("VYGPAD stoprule|{}|{}|{}", out.iterations, u8::from(done == last_done), u8::from(terms == last_terms));
+        }
+        last_terms = terms;
         if done == last_done {
             break;
         }
