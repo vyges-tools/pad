@@ -53,6 +53,32 @@ macro_rules! diag {
     ($($t:tt)*) => { diag_line(format!($($t)*)) };
 }
 
+/// The run's message lines (`[INFO PAD-nnnn] text`), written through the suite logger: each line
+/// on stderr as it is logged, and an event under its code. One logger per process, as the
+/// reference has one per session.
+fn log_message(warning: bool, id: u16, text: String) {
+    use std::sync::{Mutex, OnceLock};
+    use vyges_events::logger::Logger;
+    static LOG: OnceLock<Mutex<Logger>> = OnceLock::new();
+    let mut log = LOG.get_or_init(|| Mutex::new(Logger::new().events("vyges-pad"))).lock().unwrap_or_else(|e| e.into_inner());
+    if warning {
+        log.warn("PAD", id, text);
+    } else {
+        log.info("PAD", id, text);
+    }
+    for l in log.take_lines() {
+        eprintln!("{l}");
+    }
+}
+
+macro_rules! info {
+    ($id:expr, $($t:tt)*) => { log_message(false, $id, format!($($t)*)) };
+}
+
+macro_rules! warning {
+    ($id:expr, $($t:tt)*) => { log_message(true, $id, format!($($t)*)) };
+}
+
 
 // ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
 // registry is what actually decides it (`group: "physical"`). It read `vyges loom pad`
@@ -519,6 +545,13 @@ fn place_corners(args: &[String]) -> ExitCode {
             &blockages(&db),
             &|layer| db.layer_get_spacing(layer),
         ) {
+            // `placeCorners`: a corner it would create is not generated (PAD-45); one already in
+            // the design is left unplaced (PAD-46).
+            if db.inst_master(&p.name).is_empty() {
+                warning!(45, "Skipping corner cell generation for {} due to overlapping instances", p.name);
+            } else {
+                warning!(46, "Skipping corner cell placement for {} due to overlapping instances", p.name);
+            }
             skipped.push(format!("{} ({why:?})", p.name));
             continue;
         }
@@ -2002,6 +2035,7 @@ fn rdl_route(args: &[String]) -> ExitCode {
     }
 
     let mut graph = rdl::Graph::build(&g, &clear);
+    info!(5, "Routing {} nets", nets.len());
     let done =
         rdl::route_all(
             &mut graph,
@@ -2016,6 +2050,9 @@ fn rdl_route(args: &[String]) -> ExitCode {
             allow45,
             &|a, b| blockers.blocked(a, b),
         );
+    for &(k, routed, total) in &done.progress {
+        info!(37, "End of routing iteration {k}: {:.1}% complete", 100.0 * routed as f64 / total as f64);
+    }
 
     if !opts.dry_run {
         let applied = (|| -> Result<(), String> {
@@ -2629,6 +2666,7 @@ fn touching_nets(db: &Db, pad: &str, bond: &str) -> Vec<(String, String)> {
 fn make_bterm(db: &mut Db, net: &str, layer: &str, shape: Rect) -> Result<(), String> {
     let mut bterm = db.net_get1st_b_term(net);
     if bterm.is_empty() {
+        warning!(33, "Could not find a block terminal associated with net: \"{net}\", creating now.");
         db.create_bterm(net, net).map_err(|e| format!("cannot make a terminal for {net}: {e}"))?;
         bterm = db.net_get1st_b_term(net);
     }
@@ -2639,6 +2677,9 @@ fn make_bterm(db: &mut Db, net: &str, layer: &str, shape: Rect) -> Result<(), St
         .map_err(|e| format!("cannot add a pin to {bterm}: {e}"))?;
     db.bpin_set_placement_status(&bterm, idx, "FIRM")
         .map_err(|e| format!("cannot fix {bterm} pin {idx}: {e}"))?;
+    let um = |v: i32| v as f64 / db.dbu_per_micron() as f64;
+    info!(116, "Creating terminal for {bterm} on {layer} at ({:.3}um, {:.3}um) - ({:.3}um, {:.3}um)",
+          um(shape.0), um(shape.1), um(shape.2), um(shape.3));
     // ⚠️ The reference makes the net special here, inside this step, not at the call site. Both
     // callers depend on it happening.
     make_special(db, net)
@@ -3172,6 +3213,7 @@ fn place_pads(args: &[String]) -> ExitCode {
             }
         }
     }
+    info!(41, "Placed {} pads in {}.", pads.len(), track.row.name);
     finish(&opts, &mut db, "pads", &placed, &[])
 }
 

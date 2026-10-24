@@ -1427,6 +1427,30 @@ pub struct Routed {
     pub attempts: usize,
     pub iterations: i32,
     pub failed: Vec<String>,
+    /// At the end of each iteration the reference reports (PAD-37): `(iteration, routed
+    /// terminals, routing terminals)`.
+    pub progress: Vec<(i32, usize, usize)>,
+}
+
+/// `getRoutedTerms` and `getRoutingTermCount`: the terminals the routed segments connect, and every
+/// terminal still in play. A routed (or locked) segment counts its source and the destination it
+/// settled on (`dests[next - 1]`); an unrouted one its source and every destination it may try.
+pub fn routing_terms(routes: &[Route]) -> (std::collections::BTreeSet<&str>, usize) {
+    let mut routed = std::collections::BTreeSet::new();
+    let mut all = std::collections::BTreeSet::new();
+    for r in routes {
+        if r.routed {
+            let reached = r.next.checked_sub(1).and_then(|k| r.dests.get(k));
+            for t in std::iter::once(r.source.as_str()).chain(reached.map(|d| d.terminal.as_str())) {
+                routed.insert(t);
+                all.insert(t);
+            }
+        } else {
+            all.insert(r.source.as_str());
+            all.extend(r.dests.iter().map(|d| d.terminal.as_str()));
+        }
+    }
+    (routed, all.len())
 }
 
 /// **L9a** — `RDLNet::isRouted`: are these two terminals ALREADY CONNECTED, through any chain of
@@ -1748,6 +1772,8 @@ pub fn route_all(
         if out.iterations > max_iterations {
             break;
         }
+        let (routed_terms, total_terms) = routing_terms(routes);
+        out.progress.push((out.iterations, routed_terms.len(), total_terms));
         let done: std::collections::BTreeSet<String> =
             routes.iter().filter(|r| r.routed).map(|r| r.source.clone()).collect();
         if done == last_done {
@@ -2689,6 +2715,23 @@ mod write_order_tests {
             locked: false,
             stubs: Vec::new(),
         }
+    }
+
+    // Rule (PAD-37, getRoutedTerms / getRoutingTermCount): a routed segment counts its source and
+    // the destination it settled on; an unrouted one its source and every destination it may try.
+    #[test]
+    fn routing_terms_count_settled_and_open_terminals() {
+        let dest = |t: &str, id| Dest { terminal: t.into(), instance: t.into(), centre: (0, 0), cover: false, id };
+        let mut a = route("b1", (0, 0), dest("p1", 1), 1);
+        a.dests.push(dest("p2", 2));
+        a.routed = true;
+        a.next = 2;
+        let mut b = route("b2", (0, 0), dest("p3", 3), 2);
+        b.dests.push(dest("p1", 1));
+        let routes = [a, b];
+        let (routed, total) = routing_terms(&routes);
+        assert_eq!(routed.into_iter().collect::<Vec<_>>(), ["b1", "p2"]);
+        assert_eq!(total, 5, "b1 p2 + b2 p3 p1");
     }
 
     /// ⛔ **`removeTerminalAccess` restores with the CHECKS ON.** An edge taken out to make room
