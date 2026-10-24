@@ -1622,7 +1622,6 @@ pub fn route_all(
     // `preprocess` runs before this and marks a segment routed when its terminals already touch,
     // so such a segment is never attempted — and never reported failed either.
     let mut queue: Vec<usize> = (0..routes.len()).filter(|&i| !routes[i].routed).collect();
-    let mut last_done: std::collections::BTreeSet<String> = Default::default();
     let mut last_terms: std::collections::BTreeSet<String> = Default::default();
 
     loop {
@@ -1775,19 +1774,16 @@ pub fn route_all(
         }
         let (routed_terms, total_terms) = routing_terms(routes);
         out.progress.push((out.iterations, routed_terms.len(), total_terms));
-        let done: std::collections::BTreeSet<String> =
-            routes.iter().filter(|r| r.routed).map(|r| r.source.clone()).collect();
-        // `VYGES_PAD_TRACE`: both stop predicates — the routed SOURCES unchanged (this loop's) and
-        // the routed TERMINALS unchanged (the reference's `last_itr_routed == routed_terms`).
+        // ⛔ **The stop is the routed TERMINALS unchanged, not the routed sources** — the
+        // reference's `last_itr_routed == routed_terms`, over `getRoutedTerms`. A segment that keeps
+        // its source but settles on a different destination after a rip-up changes the terminals
+        // and NOT the sources: the reference goes round again, and stopping on the sources ends
+        // the run an iteration early.
         let terms: std::collections::BTreeSet<String> = routed_terms.iter().map(|t| t.to_string()).collect();
-        if std::env::var("VYGES_PAD_TRACE").is_ok() {
-            eprintln!("VYGPAD stoprule|{}|{}|{}", out.iterations, u8::from(done == last_done), u8::from(terms == last_terms));
-        }
-        last_terms = terms;
-        if done == last_done {
+        if terms == last_terms {
             break;
         }
-        last_done = done;
+        last_terms = terms;
 
         let failed = failed_routes(routes);
         if failed.is_empty() {
@@ -2740,6 +2736,23 @@ mod write_order_tests {
         let (routed, total) = routing_terms(&routes);
         assert_eq!(routed.into_iter().collect::<Vec<_>>(), ["b1", "p2"]);
         assert_eq!(total, 5, "b1 p2 + b2 p3 p1");
+    }
+
+    /// Rule (the routing loop's stop, `last_itr_routed == routed_terms`): the compared set is the
+    /// routed TERMINALS. A segment rerouted to its next destination keeps the same routed sources
+    /// but changes the terminals, so the loop must not take the two states as unchanged.
+    #[test]
+    fn the_stop_set_moves_when_a_route_settles_elsewhere() {
+        let dest = |t: &str, id| Dest { terminal: t.into(), instance: t.into(), centre: (0, 0), cover: false, id };
+        let mut a = route("b1", (0, 0), dest("p1", 1), 1);
+        a.dests.push(dest("p2", 2));
+        a.routed = true;
+        a.next = 1;
+        let before = routing_terms(std::slice::from_ref(&a)).0.into_iter().map(str::to_string).collect::<Vec<_>>();
+        a.next = 2;
+        let after = routing_terms(std::slice::from_ref(&a)).0.into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(before, ["b1", "p1"]);
+        assert_eq!(after, ["b1", "p2"], "same source, different settled terminal");
     }
 
     /// ⛔ **`removeTerminalAccess` restores with the CHECKS ON.** An edge taken out to make room
