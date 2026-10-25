@@ -18,6 +18,10 @@
 //!
 //! Nothing in this module reads a database; the binary does that and hands values in.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_pad::…` paths resolve here.
+extern crate self as vyges_pad;
+
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -52,3 +56,10 @@ pub use place::{
 pub use rdl::{edges as rdl_edges, grid as rdl_grid, thin, Grid};
 pub use spread::{forces, ideal_position, nearest_legal, pool_adjacent_violators, unconstrained_start};
 pub use ring::{make_rows, row_name, Offsets, Rotations, Row, RowDir, Site};
+
+/// The `vyges-pad` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
