@@ -433,6 +433,9 @@ pub struct Graph {
     pub points: Vec<Point>,
     pub index: std::collections::HashMap<Point, usize>,
     pub adj: Vec<Vec<(usize, i64)>>,
+    /// How many vertices are GRID points: `0..grid`. Everything after is a terminal centre or
+    /// snap point grafted on by an access, which this graph keeps once made.
+    pub grid: usize,
 }
 
 impl Graph {
@@ -451,7 +454,8 @@ impl Graph {
             adj[ia].push((ib, w));
             adj[ib].push((ia, w));
         }
-        Graph { points, index, adj }
+        let grid = points.len();
+        Graph { points, index, adj, grid }
     }
 }
 
@@ -496,6 +500,10 @@ pub struct Undo {
     /// note where `restore_scale` was deleted.
     pub restore: Vec<(usize, usize, i64)>,
     pub cut: Vec<(usize, usize)>,
+    /// The non-grid vertices this access put into the graph, in the order it did (the centre,
+    /// then each snap): the reference creates them fresh for the attempt, after every grid vertex,
+    /// and removes them with the access — so in ITS graph they are numbered in this order.
+    pub added: Vec<usize>,
 }
 
 impl Graph {
@@ -537,6 +545,9 @@ pub fn insert_access(
 ) -> Undo {
     let mut undo = Undo::default();
     let c = graph.vertex(centre);
+    if c >= graph.grid {
+        undo.added.push(c);
+    }
     for &snap in snaps {
         // The two grid points this snap sits between, on its own line.
         let between = if g.x.binary_search(&snap.0).is_ok() {
@@ -562,6 +573,9 @@ pub fn insert_access(
             graph.cut(a, b);
         }
         let sv = graph.vertex(snap);
+        if sv >= graph.grid && !undo.added.contains(&sv) {
+            undo.added.push(sv);
+        }
         let w = edge_weight(snap, centre);
         graph.join(sv, c, w);
         undo.cut.push((sv, c));
@@ -838,12 +852,27 @@ pub fn segment_hits_polygon(a: Point, b: Point, poly: &[Point]) -> bool {
 /// Every edge touching a route vertex goes, and so does every edge crossing the route's corridor.
 /// ⚠️ Recorded rather than simply deleted: rip-up has to restore exactly these edges, and
 /// recomputing which ones they were after the graph has moved on gives a different set.
-pub fn commit_route(
+pub fn commit_route(graph: &mut Graph, route: &[Point], width: i32, spacing: i32, allow45: bool) -> Undo {
+    commit_route_ranked(graph, route, width, spacing, allow45, &|v| v)
+}
+
+/// [`commit_route`], its edges taken out (and so later put back) in the order of `rank`: the
+/// reference's vertex number for each of ours.
+///
+/// ⛔ **The corridor is a set ordered by `minmax(source, target)` VERTEX NUMBERS**
+/// (`GridGraphEdgeLess`), and rip-up re-adds a route's edges in that order, each appended to its
+/// vertices' edge lists — so the order decides later equal-cost paths. Grid vertices are numbered
+/// alike on both sides; the attempt's access vertices are numbered after them in creation order in
+/// the reference (it makes and removes them per attempt), while this graph keeps each one at the
+/// number it got when first made. Ordering by our own numbers put an earlier attempt's snap ahead
+/// of this attempt's source (`rdl_route_max_iterations`, `BUMP_13_3` -> `u_vzz_9`).
+pub fn commit_route_ranked(
     graph: &mut Graph,
     route: &[Point],
     width: i32,
     spacing: i32,
     allow45: bool,
+    rank: &dyn Fn(usize) -> usize,
 ) -> Undo {
     let mut undo = Undo::default();
     let corridor = commit_corridor(route, width, spacing);
@@ -917,6 +946,11 @@ pub fn commit_route(
         }
     }
 
+    let mut drop: Vec<(usize, usize)> = drop.into_iter().collect();
+    drop.sort_by_key(|&(a, b)| {
+        let (ra, rb) = (rank(a), rank(b));
+        (ra.min(rb), ra.max(rb))
+    });
     for (a, b) in drop {
         if let Some(w) = graph.weight_between(a, b) {
             undo.restore.push((a, b, w));
@@ -1342,13 +1376,20 @@ pub fn is_failed(r: &Route) -> bool {
 /// ⚠️ A route whose own source terminal was reached by **some other** route is not a failure: the
 /// bump is connected, just not by this route. Counting it would rip up working routes to retry
 /// something already done.
+///
+/// ⛔ **"Reached" is a routed route's two ROUTED terminals, kept only when they are COVER terms**:
+/// its source (always a cover — a route is only made for one) and the destination it SETTLED on,
+/// `dests[next - 1]` (taking a destination moves `next` past it; a locked route points `next` past
+/// the one it touches). Reading `peek()` — the destination after it — exempted bumps no route had
+/// reached and missed the ones that were, which ripped up a different set after iteration 1 of
+/// `rdl_route_max_iterations` (27 failed nets in the reference, 19 here).
 pub fn failed_routes(routes: &[Route]) -> Vec<usize> {
     let reached: std::collections::BTreeSet<&str> = routes
         .iter()
         .filter(|r| r.routed)
         .flat_map(|r| {
-            std::iter::once(r.source.as_str())
-                .chain(r.peek().map(|d| d.terminal.as_str()))
+            let settled = r.next.checked_sub(1).and_then(|k| r.dests.get(k)).filter(|d| d.cover);
+            std::iter::once(r.source.as_str()).chain(settled.map(|d| d.terminal.as_str()))
         })
         .collect();
     routes
@@ -1562,13 +1603,26 @@ pub fn undo_access(graph: &mut Graph, undo: &Undo, blocked_edge: &dyn Fn(Point, 
     for &(a, b) in &undo.cut {
         graph.cut(a, b);
     }
+    let trace = rdl_trace();
     for &(a, b, weight) in &undo.restore {
         let (pa, pb) = (graph.points[a], graph.points[b]);
-        if blocked_edge(pa, pb) {
+        let blocked = blocked_edge(pa, pb);
+        if trace {
+            eprintln!("VYG readd {},{}-{},{}:{} {}", pa.0, pa.1, pb.0, pb.1, weight, u8::from(!blocked));
+        }
+        if blocked {
             continue;
         }
         graph.join(a, b, weight);
     }
+}
+
+/// The router's call-sequence trace (`VYGES_PAD_RDLTRACE`): rip-up lists as the reference's
+/// `Router_ripup` debug prints them, and per committed route its points and edges, per rip-up the
+/// edges put back, per terminal-access re-add the edge and whether it went back.
+fn rdl_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYGES_PAD_RDLTRACE").is_some())
 }
 
 /// **L8** — is this access point too close to a route already committed?
@@ -1718,8 +1772,17 @@ pub fn route_all(
                         .collect()
                 };
                 let (src_open, dst_open) = (open(s_snaps), open(d_snaps));
-                let a = insert_access(graph, grid, *s_centre, &src_open, allow45, obstructed);
-                let b = insert_access(graph, grid, *d_centre, &dst_open, allow45, obstructed);
+                // ⛔ **A snap-to-neighbour access edge is refused when it runs through a committed
+                // route, not only through an obstruction.** The reference adds it with
+                // `addGraphEdge(snap, pt, {})`, whose defaults check obstructions AND routes:
+                // `isIntersecting(line, 0)`, the line through any routed segment's route point.
+                // Checking obstructions alone grafted an edge across a laid route that a later
+                // corridor then removed (`rdl_route_max_iterations`, `BUMP_2_4` -> `u_vdd_15`).
+                let access_obstructed = |p0: Point, p1: Point| -> bool {
+                    obstructed(p0, p1) || laid.iter().any(|pts| pts.iter().any(|&pt| point_on_segment(pt, p0, p1)))
+                };
+                let a = insert_access(graph, grid, *s_centre, &src_open, allow45, &access_obstructed);
+                let b = insert_access(graph, grid, *d_centre, &dst_open, allow45, &access_obstructed);
                 let path = shortest_path(graph, *s_centre, *d_centre, turn_penalty);
                 out.log.push((
                     routes[i].source.clone(),
@@ -1729,9 +1792,13 @@ pub fn route_all(
                     path.len(),
                 ));
 
+                // ⛔ The SOURCE's access comes out first, then the destination's — the reference's
+                // `removeTerminalAccess(access0); removeTerminalAccess(access1)`, not last-in
+                // first-out. Each puts its edges back by appending them to the vertices' edge
+                // lists, so the order decides which of two equal-cost paths a later search takes.
                 if path.is_empty() {
-                    graph.undo(&b);
                     graph.undo(&a);
+                    graph.undo(&b);
                     continue;
                 }
                 // ⚠️ The corridor is taken out **while the terminal access is still grafted on**,
@@ -1739,7 +1806,45 @@ pub fn route_all(
                 // vertices, so committing first removes the edges around them too; undoing the
                 // access first leaves those edges in place and the next route may run straight
                 // past a terminal another route is already using.
-                committed[i] = Some(commit_route(graph, &path, width, spacing, allow45));
+                let mut fresh: Vec<usize> = a.added.clone();
+                fresh.extend(b.added.iter().filter(|v| !a.added.contains(v)));
+                let grid_vertices = graph.grid;
+                let rank = |v: usize| -> usize {
+                    if v < grid_vertices {
+                        return v;
+                    }
+                    let k = fresh.iter().position(|&f| f == v).unwrap_or(fresh.len() + v);
+                    grid_vertices + k
+                };
+                let mut undo = commit_route_ranked(graph, &path, width, spacing, allow45, &rank);
+                let corridor_edges = undo.restore.len();
+                // ⛔ **A route also owns the access edges it runs through.** Of the edges the two
+                // terminal accesses took out (the source's, then the destination's, each in the
+                // order taken), every one with an end ON the path is appended to the route's own
+                // edges, after the corridor — so a rip-up puts it back. Access undo below re-adds
+                // them only when unobstructed, and the route now obstructs them: without this they
+                // were lost for good, and every path after the first rip-up ran on a graph short
+                // of them (`rdl_route_max_iterations`: one vertex longer, iteration 2, attempt 5).
+                for &(x, y, w) in a.restore.iter().chain(&b.restore) {
+                    let (px, py) = (graph.points[x], graph.points[y]);
+                    if path.contains(&px) || path.contains(&py) {
+                        undo.restore.push((x, y, w));
+                    }
+                }
+                if rdl_trace() {
+                    let pts: String = path.iter().map(|p| format!(" {},{}", p.0, p.1)).collect();
+                    eprintln!("VYG commit {} -> {} n={}{}", routes[i].source, d.terminal, path.len(), pts);
+                    let es: String = undo
+                        .restore
+                        .iter()
+                        .map(|&(x, y, w)| {
+                            let (px, py) = (graph.points[x], graph.points[y]);
+                            format!(" {},{}-{},{}:{}", px.0, px.1, py.0, py.1, w)
+                        })
+                        .collect();
+                    eprintln!("VYG edges {} n={} commit={}{}", routes[i].source, undo.restore.len(), corridor_edges, es);
+                }
+                committed[i] = Some(undo);
                 // ⛔ **Terminal access is undone with the CHECKS ON** — see `undo_access`. The
                 // route just committed is part of what those checks see, which is why this runs
                 // AFTER `commit_route`.
@@ -1751,8 +1856,8 @@ pub fn route_all(
                     obstructed(p0, p1)
                         || settled.iter().any(|pts| pts.iter().any(|&pt| point_on_segment(pt, p0, p1)))
                 };
-                undo_access(graph, &b, &checked);
                 undo_access(graph, &a, &checked);
+                undo_access(graph, &b, &checked);
                 laid_path = Some((*s_centre, *d_centre, path));
                 break;
             }
@@ -1789,6 +1894,14 @@ pub fn route_all(
         if failed.is_empty() {
             break;
         }
+        // The reference's `-debug PAD Router_ripup 2` lines, under `VYGES_PAD_RDLTRACE`.
+        let ripup_trace = rdl_trace();
+        if ripup_trace {
+            eprintln!("[DEBUG PAD-Router_ripup] Failed routes at end of {} iteration: {} routes", out.iterations, failed.len());
+            for &f in &failed {
+                eprintln!("[DEBUG PAD-Router_ripup]   {}", routes[f].source);
+            }
+        }
         // ⚠️ Choose everything to displace BEFORE displacing anything: ripping up as we go would
         // let a later failure probe a graph the earlier ones have already changed, so which routes
         // move would depend on the order the failures happen to be listed in.
@@ -1798,9 +1911,35 @@ pub fn route_all(
                 ripped.insert(t);
             }
         }
+        if ripup_trace {
+            eprintln!("[DEBUG PAD-Router_ripup] Ripping up {} routes", ripped.len());
+        }
+        // ⛔ **Ripped up in TERMINAL ID order** — the reference's rip-up set is a `std::set` keyed on
+        // the source terminal's id (`RDLSegmentPtrLess`), not on where the route sits in the route
+        // list (net by net). Each rip-up appends its edges back to the graph, so the order decides
+        // later equal-cost paths. The re-queue order does not matter (the queue is a heap).
+        let mut ripped: Vec<usize> = ripped.into_iter().collect();
+        ripped.sort_by_key(|&t| routes[t].id);
         for &t in &ripped {
+            if ripup_trace {
+                let n = committed[t].as_ref().map_or(0, |u| u.restore.len());
+                eprintln!("VYG ripup {} n={}", routes[t].source, n);
+            }
+            // ⛔ **Only edges between GRID vertices come back.** The reference puts a route's edges
+            // back by their end POINTS, and the terminal centres and snap points its corridor also
+            // took edges from were deleted with the attempt's access — `addGraphEdge` finds no
+            // vertex there and skips the edge. This graph keeps those vertices, so restoring every
+            // edge brought dead access edges back to life (`rdl_route_max_iterations`, iteration 2:
+            // three snap-to-centre edges a later corridor then took out).
             if let Some(u) = committed[t].take() {
-                graph.undo(&u);
+                for &(x, y) in &u.cut {
+                    graph.cut(x, y);
+                }
+                for &(x, y, w) in &u.restore {
+                    if x < graph.grid && y < graph.grid {
+                        graph.join(x, y, w);
+                    }
+                }
             }
             routes[t].routed = false;
             routes[t].points.clear();
@@ -1989,9 +2128,67 @@ mod tests {
         mine.pending = false;
         let mut other = route((0, 0), 2, vec![dest("BUMP_A/PAD", "BUMP_A", (5, 5), true, 3)]);
         other.routed = true;
+        other.next = 1; // settled on BUMP_A: taking a destination moves `next` past it
         assert!(is_failed(&mine));
         assert!(failed_routes(&[mine.clone(), other]).is_empty(), "already connected");
         assert_eq!(failed_routes(&[mine]).len(), 1, "nobody else reached it");
+    }
+
+    /// Rule (`getFailedRoutes`): "reached" is a routed segment's ROUTED terminals — its source and
+    /// the destination it settled on, `dests[next - 1]` — never the destination after it, which
+    /// it never tried. Witness: `rdl_route_max_iterations` failed 27 nets in the reference and 19
+    /// here while the next destination was read.
+    #[test]
+    fn the_bump_a_route_settled_on_is_reached_not_the_one_after_it() {
+        let failed = |name: &str, id| {
+            let mut r = route((0, 0), id, vec![]);
+            r.source = name.into();
+            r.pending = false;
+            r
+        };
+        let mut other = route(
+            (0, 0),
+            9,
+            vec![dest("BUMP_A/PAD", "BUMP_A", (5, 5), true, 3), dest("BUMP_B/PAD", "BUMP_B", (9, 9), true, 4)],
+        );
+        other.routed = true;
+        other.next = 1;
+        let routes = [failed("BUMP_A/PAD", 1), failed("BUMP_B/PAD", 2), other];
+        assert_eq!(failed_routes(&routes), vec![1], "A is reached; B, only next in line, is not");
+    }
+
+    /// Rule (`getFailedRoutes`): only COVER terminals count as reached (`isCoverTerm`); a routed
+    /// segment that settled on a pad reaches no bump.
+    #[test]
+    fn only_a_cover_destination_counts_as_reached() {
+        let mut mine = route((0, 0), 1, vec![]);
+        mine.source = "P/PAD".into();
+        mine.pending = false;
+        let mut other = route((0, 0), 2, vec![dest("P/PAD", "P", (5, 5), false, 3)]);
+        other.routed = true;
+        other.next = 1;
+        assert_eq!(failed_routes(&[mine, other]).len(), 1);
+    }
+
+    /// Rule (`commitRoute`): the corridor's edges come out — and a rip-up later puts them back, each
+    /// appended to its vertices' edge lists — in `minmax(source, target)` order of the REFERENCE's
+    /// vertex numbers (`GridGraphEdgeLess`), which `rank` supplies; our own numbering is not it for
+    /// the access vertices the reference makes fresh each attempt.
+    #[test]
+    fn corridor_edges_come_out_in_reference_vertex_order() {
+        let points = vec![(0, 0), (100, 0), (200, 0), (0, 100)];
+        let index = points.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+        let mut graph = Graph { points, index, adj: vec![Vec::new(); 4], grid: 2 };
+        graph.join(0, 1, 100);
+        graph.join(0, 2, 200);
+        graph.join(0, 3, 100);
+        let mut g2 = Graph { points: graph.points.clone(), index: graph.index.clone(), adj: graph.adj.clone(), grid: 2 };
+        let ours = commit_route(&mut graph, &[(0, 0)], 2, 2, false);
+        assert_eq!(ours.restore.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), vec![(0, 1), (0, 2), (0, 3)]);
+        // Vertices 2 and 3 are access vertices made in the order 3, then 2.
+        let rank = |v: usize| match v { 3 => 2, 2 => 3, v => v };
+        let reference = commit_route_ranked(&mut g2, &[(0, 0)], 2, 2, false, &rank);
+        assert_eq!(reference.restore.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), vec![(0, 1), (0, 3), (0, 2)]);
     }
 
     #[test]

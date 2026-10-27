@@ -56,27 +56,40 @@ macro_rules! diag {
 /// The run's message lines (`[INFO PAD-nnnn] text`), written through the suite logger: each line
 /// on stderr as it is logged, and an event under its code. One logger per process, as the
 /// reference has one per session.
-fn log_message(warning: bool, id: u16, text: String) {
+fn log_message(level: Level, id: u16, text: String) {
     use std::sync::{Mutex, OnceLock};
     use vyges_events::logger::Logger;
     static LOG: OnceLock<Mutex<Logger>> = OnceLock::new();
     let mut log = LOG.get_or_init(|| Mutex::new(Logger::new().events("vyges-pad"))).lock().unwrap_or_else(|e| e.into_inner());
-    if warning {
-        log.warn("PAD", id, text);
-    } else {
-        log.info("PAD", id, text);
+    match level {
+        Level::Info => log.info("PAD", id, text),
+        Level::Warning => log.warn("PAD", id, text),
+        // The run goes on to its own exit status; the logger's stop is not used.
+        Level::Error => {
+            let _ = log.error::<()>("PAD", id, text);
+        }
+        Level::Report => log.report(text),
     }
     for l in log.take_lines() {
         eprintln!("{l}");
     }
 }
 
+#[derive(Clone, Copy)]
+enum Level {
+    Info,
+    Warning,
+    Error,
+    /// The text alone, no prefix (`logger_->report`).
+    Report,
+}
+
 macro_rules! info {
-    ($id:expr, $($t:tt)*) => { log_message(false, $id, format!($($t)*)) };
+    ($id:expr, $($t:tt)*) => { log_message(Level::Info, $id, format!($($t)*)) };
 }
 
 macro_rules! warning {
-    ($id:expr, $($t:tt)*) => { log_message(true, $id, format!($($t)*)) };
+    ($id:expr, $($t:tt)*) => { log_message(Level::Warning, $id, format!($($t)*)) };
 }
 
 
@@ -2183,14 +2196,40 @@ fn rdl_route(args: &[String]) -> ExitCode {
     // ⚠️ The database is written FIRST and the error raised after, so the wires that did route are
     // kept. `rdl_route_max_iterations` is upstream's own test of this path: it `catch`es the
     // failure and asserts the message is PAD-0007, which is why it ships no DEF golden.
-    let failed_nets: std::collections::BTreeSet<&str> = rdl::failed_routes(&routes)
-        .into_iter()
-        .filter_map(|i| access.get(&routes[i].source).map(|(n, _)| n.as_str()))
-        .collect();
+    //
+    // PAD-0006 lists them first: the nets by id, each net's failed terminals by id, and per
+    // terminal the destinations it is not connected to through any chain of routes, the first five
+    // named — from exactly five on, `, ... (N possible terminals)`.
+    let mut failed_nets: std::collections::BTreeMap<(u32, &str), std::collections::BTreeMap<u64, usize>> =
+        Default::default();
+    for i in rdl::failed_routes(&routes) {
+        let Some((net, _)) = access.get(&routes[i].source) else { continue };
+        let id = db.net_id(net).unwrap_or(u32::MAX);
+        failed_nets.entry((id, net.as_str())).or_default().insert(routes[i].id, i);
+    }
     let failure = (!failed_nets.is_empty()).then(|| {
-        for n in &failed_nets {
-            diag!("vyges-pad: could not route {n}");
+        let pairs = rdl::routed_pairs(&routes);
+        warning!(6, "Failed to route the following {} nets:", failed_nets.len());
+        for ((_, net), segments) in &failed_nets {
+            log_message(Level::Report, 0, format!("  {net}"));
+            for &i in segments.values() {
+                let r = &routes[i];
+                let unrouted: Vec<&str> = r
+                    .dests
+                    .iter()
+                    .map(|d| d.terminal.as_str())
+                    .filter(|t| !rdl::is_routed(&pairs, &r.source, t))
+                    .collect();
+                let named = unrouted.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+                let line = if unrouted.len() < 5 {
+                    format!("    {} -> {named}", r.source)
+                } else {
+                    format!("    {} -> {named}, ... ({} possible terminals)", r.source, unrouted.len())
+                };
+                log_message(Level::Report, 0, line);
+            }
         }
+        log_message(Level::Error, 7, format!("Failed to route {} nets.", failed_nets.len()));
         format!("failed to route {} nets", failed_nets.len())
     });
     finish_report(&opts, &mut db, "rdl-route", &made, &done.failed, failure)
