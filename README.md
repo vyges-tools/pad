@@ -1,5 +1,7 @@
 # vyges-pad
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 IO pad and bump placement over an OpenDB database.
 
 A chip reaches its package through a **ring** of IO cells around the die edge and an array of bumps
